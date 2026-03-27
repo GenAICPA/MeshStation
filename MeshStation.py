@@ -25,28 +25,99 @@ import atexit
 import secrets
 import urllib.request
 import urllib.error
+import math
+import signal
+import tkinter as tk
+from tkinter import scrolledtext, Canvas
+import gc
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from meshtastic import mesh_pb2, admin_pb2, telemetry_pb2, config_pb2
 
-from nicegui import ui, app
+from nicegui import ui, app, core
 from fastapi import Request
 
 # --- CONSTANTS ---
 PROGRAM_NAME = "MeshStation"
 PROGRAM_SHORT_DESC = "Meshtastic SDR Analyzer & Desktop GUI"
 AUTHOR = "IronGiu"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LICENSE = "GNU General Public License v3.0"
 GITHUB_URL = "https://github.com/IronGiu/MeshStation"
 DONATION_URL = "https://ko-fi.com/irongiu"
 SUPPORTERS_URL = "https://github.com/IronGiu/MeshStation/SUPPORTERS.md"
 GITHUB_RELEASES_URL = f"{GITHUB_URL}/releases"
 LANG_FILE_NAME = "languages.json"
-DEBUGGING = False
+# --- CLI argument parsing ---
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        prog="MeshStation",
+        description=f"{PROGRAM_NAME} — {PROGRAM_SHORT_DESC}",
+        add_help=False  # manage --help manually to print and exit without starting anything
+    )
+    parser.add_argument(
+        "--help", action="store_true",
+        help="Show this help message and exit"
+    )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="Enable debug mode (verbose logging)"
+    )
+    args, _ = parser.parse_known_args()
+    if args.help:
+        parser.print_help()
+        sys.exit(0)
+    return args
+
+_cli_args = _parse_args()
+DEBUGGING = _cli_args.debug
 SHOW_DEV_TOOLS = DEBUGGING
 SHUTDOWN_TOKEN = secrets.token_urlsafe(24)
+MAIN_LOOP = None
+
+# Chat Constants
+_CHAT_DOM_WINDOW = 30      # messages visible in the DOM
+_CHAT_LOAD_STEP  = 20      # how many are loaded by pressing "Load more"
+
+gc.enable()
+# Optimized thresholds: less frequent cleaning to avoid interrupting the SDR stream
+gc.set_threshold(1000, 15, 15)
+
+def _patch_nicegui_gc_safety():
+    """Patch for known nicegui + garbage collector issues, Prevents C-level crash 0x80000003 on Python 3.10 + Windows"""
+    try:
+        import nicegui.helpers as _nh
+        _original_expects = _nh.expects_arguments
+
+        def _safe_expects_arguments(func):
+            try:
+                # Let's call the original function; if the object is being destroyed,
+                # inspect.signature would fail here.
+                return _original_expects(func)
+            except Exception:
+                # In case of error (dying object), we assume that it does not want arguments
+                return False
+
+        _nh.expects_arguments = _safe_expects_arguments
+        # We also apply the patch to the events module for security
+        import nicegui.events as _ne
+        _ne.expects_arguments = _safe_expects_arguments
+        
+        if DEBUGGING: print("DEBUG: GC safety patch applied safely", flush=True)
+    except:
+        pass
+
+_patch_nicegui_gc_safety()
+
+def _debug_thread_watchdog():
+    import time
+    while True:
+        time.sleep(180)
+        now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        print(f"[{now}] DEBUG: main thread alive", flush=True)
+if DEBUGGING:
+    threading.Thread(target=_debug_thread_watchdog, daemon=True).start()
 
 def _parse_version_tuple(v: str) -> tuple[int, int, int]:
     s = (v or "").strip()
@@ -110,47 +181,218 @@ def _fetch_latest_github_release(timeout_sec: float = 10.0) -> dict | None:
             print(f"Error fetching latest release: {e}")
         return None
 
-LORA_PRESETS = {
-    "Medium Fast": {
-        "EU_868": {"center_freq": 869_525_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 9},
-        "EU_433": {"center_freq": 433_125_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 9},
-        "US_915": {"center_freq": 913_125_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 9},
-    },
-    "Long Fast": {
-        "EU_868": {"center_freq": 869_525_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 11},
-        "EU_433": {"center_freq": 433_875_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 11},
-        "US_915": {"center_freq": 906_875_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 11},
-    },
-    "Medium Slow": {
-        "EU_868": {"center_freq": 869_525_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 10},
-        "EU_433": {"center_freq": 433_875_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 10},
-        "US_915": {"center_freq": 914_875_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 10},
-    },
-    "Long Slow (depr.)": {
-        "EU_868": {"center_freq": 869_462_500, "samp_rate": 1_000_000, "lora_bw": 125_000, "sf": 12},
-        "EU_433": {"center_freq": 433_312_500, "samp_rate": 1_000_000, "lora_bw": 125_000, "sf": 12},
-        "US_915": {"center_freq": 905_312_500, "samp_rate": 1_000_000, "lora_bw": 125_000, "sf": 12},
-    },
-    "Long Moderate": {
-        "EU_868": {"center_freq": 869_587_500, "samp_rate": 1_000_000, "lora_bw": 125_000, "sf": 11},
-        "EU_433": {"center_freq": 433_687_500, "samp_rate": 1_000_000, "lora_bw": 125_000, "sf": 11},
-        "US_915": {"center_freq": 902_687_500, "samp_rate": 1_000_000, "lora_bw": 125_000, "sf": 11},
-    },
-    "Short Slow": {
-        "EU_868": {"center_freq": 869_525_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 8},
-        "EU_433": {"center_freq": 433_625_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 8},
-        "US_915": {"center_freq": 920_625_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 8},
-    },
-    "Short Fast": {
-        "EU_868": {"center_freq": 869_525_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 7},
-        "EU_433": {"center_freq": 433_875_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 7},
-        "US_915": {"center_freq": 918_875_000, "samp_rate": 1_000_000, "lora_bw": 250_000, "sf": 7},
-    },
-    "Short Turbo": {
-        "EU_433": {"center_freq": 433_750_000, "samp_rate": 1_000_000, "lora_bw": 500_000, "sf": 7},
-        "US_915": {"center_freq": 926_750_000, "samp_rate": 1_000_000, "lora_bw": 500_000, "sf": 7},
-    },
+# --- Meshtastic Region Definitions ---
+# Fields: freq_start (MHz), freq_end (MHz), dutycycle, spacing (MHz), power_limit (dBm), wide_lora, name
+MESHTASTIC_REGIONS = {
+    "UNSET":        {"freq_start": 902.0,   "freq_end": 928.0,   "dutycycle": 0.0,   "spacing": 0.0, "power_limit": 0,  "wide_lora": False, "description": "Not Set"},
+    "US":           {"freq_start": 902.0,   "freq_end": 928.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 30, "wide_lora": False, "description": "United States"},
+    "EU_433":       {"freq_start": 433.0,   "freq_end": 434.0,   "dutycycle": 10.0,  "spacing": 0.0, "power_limit": 10, "wide_lora": False, "description": "EU 433MHz"},
+    "EU_868":       {"freq_start": 869.4,   "freq_end": 869.65,  "dutycycle": 10.0,  "spacing": 0.0, "power_limit": 27, "wide_lora": False, "description": "EU 868MHz"},
+    "CN":           {"freq_start": 470.0,   "freq_end": 510.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 19, "wide_lora": False, "description": "China"},
+    "JP":           {"freq_start": 920.5,   "freq_end": 923.5,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 13, "wide_lora": False, "description": "Japan"},
+    "ANZ":          {"freq_start": 915.0,   "freq_end": 928.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 30, "wide_lora": False, "description": "Australia & NZ"},
+    "ANZ_433":      {"freq_start": 433.05,  "freq_end": 434.79,  "dutycycle": 100.0, "spacing": 0.0, "power_limit": 14, "wide_lora": False, "description": "Australia & NZ 433 MHz"},
+    "RU":           {"freq_start": 868.7,   "freq_end": 869.2,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 20, "wide_lora": False, "description": "Russia"},
+    "KR":           {"freq_start": 920.0,   "freq_end": 923.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 23, "wide_lora": False, "description": "Korea"},
+    "TW":           {"freq_start": 920.0,   "freq_end": 925.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 27, "wide_lora": False, "description": "Taiwan"},
+    "IN":           {"freq_start": 865.0,   "freq_end": 867.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 30, "wide_lora": False, "description": "India"},
+    "NZ_865":       {"freq_start": 864.0,   "freq_end": 868.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 36, "wide_lora": False, "description": "New Zealand 865MHz"},
+    "TH":           {"freq_start": 920.0,   "freq_end": 925.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 16, "wide_lora": False, "description": "Thailand"},
+    "UA_433":       {"freq_start": 433.0,   "freq_end": 434.7,   "dutycycle": 10.0,  "spacing": 0.0, "power_limit": 10, "wide_lora": False, "description": "Ukraine 433MHz"},
+    "UA_868":       {"freq_start": 868.0,   "freq_end": 868.6,   "dutycycle": 1.0,   "spacing": 0.0, "power_limit": 14, "wide_lora": False, "description": "Ukraine 868MHz"},
+    "MY_433":       {"freq_start": 433.0,   "freq_end": 435.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 20, "wide_lora": False, "description": "Malaysia 433MHz"},
+    "MY_919":       {"freq_start": 919.0,   "freq_end": 924.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 27, "wide_lora": False, "description": "Malaysia 919MHz"},
+    "SG_923":       {"freq_start": 917.0,   "freq_end": 925.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 20, "wide_lora": False, "description": "Singapore 923MHz"},
+    "PH_433":       {"freq_start": 433.0,   "freq_end": 434.7,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 10, "wide_lora": False, "description": "Philippines 433MHz"},
+    "PH_868":       {"freq_start": 868.0,   "freq_end": 869.4,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 14, "wide_lora": False, "description": "Philippines 868MHz"},
+    "PH_915":       {"freq_start": 915.0,   "freq_end": 918.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 24, "wide_lora": False, "description": "Philippines 915MHz"},
+    "KZ_433":       {"freq_start": 433.075, "freq_end": 434.775, "dutycycle": 100.0, "spacing": 0.0, "power_limit": 10, "wide_lora": False, "description": "Kazakhstan 433MHz"},
+    "KZ_863":       {"freq_start": 863.0,   "freq_end": 868.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 30, "wide_lora": False, "description": "Kazakhstan 863MHz"},
+    "NP_865":       {"freq_start": 865.0,   "freq_end": 868.0,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 30, "wide_lora": False, "description": "Nepal 865MHz"},
+    "BR_902":       {"freq_start": 902.0,   "freq_end": 907.5,   "dutycycle": 100.0, "spacing": 0.0, "power_limit": 30, "wide_lora": False, "description": "Brazil 902MHz"},
+    "LORA_24":      {"freq_start": 2400.0,  "freq_end": 2483.5,  "dutycycle": 0.0,   "spacing": 0.0, "power_limit": 10, "wide_lora": True,  "description": "2.4GHz worldwide"},
 }
+
+# --- Modem Presets ---
+MESHTASTIC_MODEM_PRESETS = {
+    "LONG_FAST":       {"channel_name": "LongFast",    "bw_narrow": 250.0,  "bw_wide": 812.5, "sf": 11, "cr": 5, "description": "Long Range, Fast (default)"},
+    "MEDIUM_FAST":     {"channel_name": "MediumFast",  "bw_narrow": 250.0,  "bw_wide": 812.5, "sf": 9,  "cr": 5, "description": "Medium Range, Fast"},
+    "LONG_SLOW":       {"channel_name": "LongSlow",    "bw_narrow": 125.0,  "bw_wide": 406.25,"sf": 12, "cr": 8, "description": "Long Range, Slow (deprecated)"},
+    "MEDIUM_SLOW":     {"channel_name": "MediumSlow",  "bw_narrow": 250.0,  "bw_wide": 812.5, "sf": 10, "cr": 5, "description": "Medium Range, Slow"},
+    "SHORT_FAST":      {"channel_name": "ShortFast",   "bw_narrow": 250.0,  "bw_wide": 812.5, "sf": 7,  "cr": 5, "description": "Short Range, Fast"},
+    "SHORT_SLOW":      {"channel_name": "ShortSlow",   "bw_narrow": 250.0,  "bw_wide": 812.5, "sf": 8,  "cr": 5, "description": "Short Range, Slow"},
+    "SHORT_TURBO":     {"channel_name": "ShortTurbo",  "bw_narrow": 500.0,  "bw_wide": 1625.0,"sf": 7,  "cr": 5, "description": "Short Range, Turbo (not legal everywhere)"},
+    "LONG_TURBO":      {"channel_name": "LongTurbo",   "bw_narrow": 500.0,  "bw_wide": 1625.0,"sf": 11, "cr": 8, "description": "Long Range, Turbo"},
+    "LONG_MODERATE":   {"channel_name": "LongMod",     "bw_narrow": 125.0,  "bw_wide": 406.25,"sf": 11, "cr": 8, "description": "Long Range, Moderate"},
+    "VERY_LONG_SLOW":  {"channel_name": "VLongSlow",   "bw_narrow": 62.5,   "bw_wide": 250.0, "sf": 12, "cr": 8, "description": "Very Long Range, Very Slow"},
+}
+PRESET_ID_MAP = {
+    0:  None,          # unknown / single-preset mode
+    1:  "LONG_FAST",
+    2:  "MEDIUM_FAST",
+    3:  "LONG_SLOW",
+    4:  "MEDIUM_SLOW",
+    5:  "SHORT_FAST",
+    6:  "SHORT_SLOW",
+    7:  "SHORT_TURBO",
+    8:  "LONG_TURBO",
+    9:  "LONG_MODERATE",
+    10: "VERY_LONG_SLOW",
+}
+PRESET_ID_REVERSE = {v: k for k, v in PRESET_ID_MAP.items() if v is not None}
+PRESET_COLORS = {
+    "LONG_FAST":      "#22c55e",  # green
+    "MEDIUM_FAST":    "#3b82f6",  # blue
+    "LONG_SLOW":      "#a855f7",  # purple
+    "MEDIUM_SLOW":    "#f59e0b",  # amber
+    "SHORT_FAST":     "#ef4444",  # red
+    "SHORT_SLOW":     "#f97316",  # orange
+    "SHORT_TURBO":    "#ec4899",  # pink
+    "LONG_TURBO":     "#06b6d4",  # cyan
+    "LONG_MODERATE":  "#84cc16",  # lime
+    "VERY_LONG_SLOW": "#64748b",  # slate
+}
+
+def show_fatal_error(title: str, message: str):
+    """Show a fatal error dialog with copyable text, works before NiceGUI starts on all platforms."""
+    close_all_splash()
+    try:
+
+        BG      = "#f8f8f8"
+        FG      = "#1a1a1a"
+        FG_ERR  = "#c0392b"
+        BTN_BG  = "#e0e0e0"
+
+        root = tk.Tk()
+        root.configure(bg=BG)
+        root.title(title)
+        root.attributes('-topmost', True)
+        root.resizable(True, True)
+        root.minsize(480, 280)
+
+        # Center on screen
+        root.update_idletasks()
+        w, h = 520, 320
+        x = (root.winfo_screenwidth() // 2) - (w // 2)
+        y = (root.winfo_screenheight() // 2) - (h // 2)
+        root.geometry(f"{w}x{h}+{x}+{y}")
+
+        # Title label
+        tk.Label(root, text=f"⛔ {title}", font=("Helvetica", 13, "bold"), fg=FG_ERR, bg=BG, pady=10).pack()
+
+        # Scrollable, selectable text area
+        txt = scrolledtext.ScrolledText(root, wrap=tk.WORD, font=("Courier", 10), height=10, relief=tk.FLAT, bg=BG, fg=FG)
+        txt.insert(tk.END, message)
+        txt.configure(state=tk.DISABLED)  # read-only but still selectable
+        txt.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 8))
+
+        # Buttons row
+        btn_frame = tk.Frame(root, bg=BG)
+        btn_frame.pack(pady=(0, 10))
+
+        def copy_to_clipboard():
+            root.clipboard_clear()
+            root.clipboard_append(message)
+            copy_btn.configure(text="✓ Copied!")
+            root.after(2000, lambda: copy_btn.configure(text="Copy to clipboard"))
+
+        copy_btn = tk.Button(btn_frame, text="Copy to clipboard", command=copy_to_clipboard, width=20, bg=BTN_BG, fg=FG)
+        copy_btn.pack(side=tk.LEFT, padx=6)
+
+        tk.Button(btn_frame, text="Open GitHub Issues", width=20, bg=BTN_BG, fg=FG,
+                  command=lambda: __import__('webbrowser').open(f"{GITHUB_URL}/issues")).pack(side=tk.LEFT, padx=6)
+
+        tk.Button(btn_frame, text="Close", command=root.destroy, width=10, bg=BTN_BG, fg=FG).pack(side=tk.LEFT, padx=6)
+
+        root.mainloop()
+
+    except Exception:
+        print(f"FATAL ERROR — {title}: {message}", file=sys.stderr)
+
+def _djb2_hash(s: str) -> int:
+    """djb2 hash algorithm."""
+    h = 5381
+    for c in s:
+        h = ((h << 5) + h + ord(c)) & 0xFFFFFFFF
+    return h
+
+def meshtastic_calc_freq(region_key: str, preset_key: str, frequency_slot: int = 0, channel_name: str | None = None) -> dict:
+    """
+    Calculate center frequency exactly as Meshtastic firmware does.
+    
+    Args:
+        region_key: e.g. "EU_868", "US"
+        preset_key: e.g. "LONG_FAST", "MEDIUM_SLOW"
+        frequency_slot: 1-based manual slot (0 = auto/hash-based)
+        channel_name: custom channel name for hash (None = use preset default name)
+    
+    Returns dict with:
+        center_freq_hz: int - center frequency in Hz (for engine)
+        center_freq_mhz: float - center frequency in MHz
+        num_slots: int - total available frequency slots
+        slot_used: int - 1-based slot number actually used
+        bw_khz: float - bandwidth in kHz
+        sf: int - spreading factor
+        cr: int - coding rate
+        channel_name: str - channel name used for hash
+        valid: bool - whether the region/preset combo is valid
+        error: str | None
+    """
+    region = MESHTASTIC_REGIONS.get(region_key)
+    preset = MESHTASTIC_MODEM_PRESETS.get(preset_key)
+    
+    if not region:
+        return {"valid": False, "error": f"Unknown region: {region_key}"}
+    if preset_key == "ALL":
+        return {"valid": True, "error": None, "all_presets": True}
+    if not preset:
+        return {"valid": False, "error": f"Unknown preset: {preset_key}"}
+    
+    wide_lora = region.get("wide_lora", False)
+    bw_khz = preset["bw_wide"] if wide_lora else preset["bw_narrow"]
+    sf = preset["sf"]
+    cr = preset["cr"]
+    spacing = region.get("spacing", 0.0)
+    freq_start = region["freq_start"]
+    freq_end = region["freq_end"]
+    
+    bw_mhz = bw_khz / 1000.0
+    
+    # num_channels = floor((freqEnd - freqStart) / (spacing + bw_MHz))
+    band_width = freq_end - freq_start
+    slot_width = spacing + bw_mhz
+    if slot_width <= 0:
+        return {"valid": False, "error": "Invalid slot width (spacing + bw <= 0)"}
+    
+    num_slots = int(math.floor(band_width / slot_width))
+    if num_slots < 1:
+        narerrtext = translate("panel.connection.settings.internal.info.band_too_narrow", "Band too narrow for preset: only {band_width}MHz available, need {slot_width}MHz per slot, preset not compatible with this region.").format(band_width=f"{band_width:.3f}", slot_width=f"{slot_width:.3f}")
+        return {"valid": False, "error": narerrtext}
+    
+    # Determine channel_num (0-based)
+    ch_name = channel_name if channel_name else preset["channel_name"]
+    if frequency_slot != 0:
+        # Manual slot: slot is 1-based in firmware, convert to 0-based
+        channel_num_0 = (frequency_slot - 1) % num_slots
+    else:
+        # Hash-based
+        channel_num_0 = _djb2_hash(ch_name) % num_slots
+    
+    # freq = freqStart + spacing/2 + channel_num * (spacing + bw_MHz)
+    freq_mhz = freq_start + (bw_mhz / 2.0) + channel_num_0 * slot_width
+    
+    return {
+        "valid": True,
+        "error": None,
+        "center_freq_mhz": freq_mhz,
+        "center_freq_hz": int(round(freq_mhz * 1_000_000)),
+        "num_slots": num_slots,
+        "slot_used": channel_num_0 + 1,  # back to 1-based for display
+        "bw_khz": bw_khz,
+        "sf": sf,
+        "cr": cr,
+        "channel_name": ch_name,
+    }
 
 # SVG Icon (Envelope with Antenna)
 APP_ICON_SVG = """
@@ -192,13 +434,22 @@ def setup_static_files():
     if os.path.isdir(maps_dir):
         app.add_static_files('/static/offlinemaps', maps_dir)
 
-def has_tile_internet():
-    try:
-        import urllib.request
-        urllib.request.urlopen('https://tile.openstreetmap.org/0/0/0.png', timeout=2)
-        return True
-    except Exception:
-        return False
+def has_tile_internet(retries=3, timeout=5) -> bool:
+    urls = [
+        'https://tile.openstreetmap.org/0/0/0.png',
+        'https://tile.openstreetmap.org/1/0/0.png',
+        'https://tile.openstreetmap.org',
+    ]
+    for attempt in range(retries):
+        for url in urls:
+            try:
+                urllib.request.urlopen(url, timeout=timeout)
+                return True
+            except Exception:
+                continue
+        if attempt < retries - 1:
+            time.sleep(0.5)
+    return False
 
 _offline_topology_cache = {}
 _offline_geo_cache = {}
@@ -616,11 +867,6 @@ def _detect_topo_object_names(topo: dict) -> dict:
 
     return best
 
-def _topo_objects_debug(topo: dict) -> list[str]:
-    # Return available object keys for troubleshooting
-    objects = (topo or {}).get('objects') or {}
-    return sorted(objects.keys())
-
 # --- CONFIGURATION & STATE ---
 
 class AppState:
@@ -633,9 +879,14 @@ class AppState:
         self.autosave_last_ts = 0.0
 
         self.direct_region = "EU_868"
-        self.direct_preset = "Medium Fast"
+        self.direct_preset = "MEDIUM_FAST"
+        self.direct_frequency_slot = 0        # 0 = auto (hash-based), 1..N = manual
+        self.direct_channel_name = ""         # "" = use default name of the preset
         self.direct_ppm = 0
         self.direct_gain = 30
+        self.direct_device_args = "rtl=0"
+        self.direct_device_detected_args = []
+        self.direct_bias_tee = False
         self.direct_port = "20002"
         self.direct_key_b64 = "AQ=="
 
@@ -648,6 +899,16 @@ class AppState:
         self.port = "20002"
         self.aes_key_b64 = "AQ==" # Default Meshtastic Key representation (means default)
         self.aes_key_bytes = None
+
+        # Multi-channel monitoring
+        # Each entry: {"id": str (uuid), "name": str, "key_b64": str, "label": str}
+        self.extra_channels = []
+        # Messages per channel: {"channel_id": deque(maxlen=100)}
+        self.channel_messages = {}  # channel_id -> list of new messages to render
+        self.channel_unread = {}    # channel_id -> bool (has unread)
+        self.channel_unread_count = {}  # channel_id -> int
+        self.active_channel_id = "default"
+        self.channels_order = [] 
         
         # Data Stores
         self.nodes = {} # Key: NodeID (e.g., "!322530e5"), Value: Dict with info
@@ -667,7 +928,10 @@ class AppState:
         self.dirty_nodes = set() # Track modified nodes for delta updates
         self.lock = threading.Lock() # Thread safety for dirty_nodes
         self.verbose_logging = True # Default to verbose logging
-        self.theme = "light"
+        self.theme = "dark"
+        self.map_center_lat = None
+        self.map_center_lng = None
+        self.map_zoom = None
 
         # Error checking
         self.rtlsdr_error_pending = False
@@ -1084,8 +1348,6 @@ class MeshStatsManager:
 state = AppState()
 mesh_stats = MeshStatsManager()
 
-splash_anim_state = {'running': False}
-
 status_label_ref = None
 current_language = "en"
 languages_data = {}
@@ -1111,14 +1373,18 @@ def set_connection_status_ui(connected: bool, mode: str | None = None):
         status_label_ref.classes(replace='text-red-500', remove='text-green-500').classes('font-bold mr-4 self-center')
 
 def _shutdown_cleanup():
+    if DEBUGGING:
+        print("DEBUG: shutdown cleanup called", flush=True)
     try:
-        stop_connection()
-    except Exception:
-        pass
-    try:
-        stop_engine_direct()
-    except Exception:
-        pass
+        if state.connect_mode == "direct":
+            stop_engine_direct()
+        state.connected = False
+        state.connect_mode = None
+    except Exception as e:
+        if DEBUGGING:
+            print(f"DEBUG: shutdown error {e}", flush=True)
+        else:
+            pass
 
 atexit.register(_shutdown_cleanup)
 
@@ -1130,8 +1396,10 @@ def hexStringToBinary(hexString):
     except ValueError:
         return b''
 
-def bytesToHexString(byteString):
-    return byteString.hex()
+def _i16_from_be(b0, b1):
+        # Decode signed int16 from big-endian bytes
+        v = (b0 << 8) | b1
+        return v - 0x10000 if v & 0x8000 else v
 
 def msb2lsb(msb):
     # Converts 32-bit ID from MSB (GnuRadio) to LSB (Meshtastic standard)
@@ -1143,7 +1411,7 @@ def parseAESKey(key_b64):
     try:
         # Default Key Handling
         # If user enters "AQ==" (which is technically just 0x01), treat it as the Meshtastic Default Channel Key
-        if key_b64 in ["0", "NOKEY", "nokey", "NONE", "none", "HAM", "ham", "AQ=="]:
+        if key_b64 in ["0", "NOKEY", "nokey", "NONE", "none", "HAM", "ham", "AQ==", "", "AA=="]:
             key_b64 = "1PG7OiApB1nwvP+rz05pAQ==" # The actual default AES256 key
         
         decoded = base64.b64decode(key_b64)
@@ -1154,6 +1422,54 @@ def parseAESKey(key_b64):
     except Exception as e:
         log_to_console(f"Key Parse Error: {e}. Using default.")
         return base64.b64decode("1PG7OiApB1nwvP+rz05pAQ==")
+
+def _xor_hash_bytes(data: bytes) -> int:
+    h = 0
+    for b in data or b"":
+        h ^= int(b) & 0xFF
+    return h & 0xFF
+
+def _meshtastic_channel_hash(channel_name: str, key_bytes: bytes) -> int:
+    name = (channel_name or "").strip()
+    if not name:
+        try:
+            name = MESHTASTIC_MODEM_PRESETS.get(
+                getattr(state, 'direct_preset', 'LONG_FAST'), {}
+            ).get('channel_name', 'LongFast')
+        except Exception:
+            name = "LongFast"
+    name_hash = _xor_hash_bytes(name.encode("utf-8", errors="ignore"))
+    key_hash = _xor_hash_bytes(bytes(key_bytes or b""))
+    return (name_hash ^ key_hash) & 0xFF
+
+_extra_channel_keys_lock = threading.Lock()
+
+def _get_extra_channel_keys() -> list[dict]:
+    with _extra_channel_keys_lock:
+        try:
+            sig = tuple(
+                (str(ch.get("id")), str(ch.get("name") or ""), str(ch.get("key_b64") or ""))
+                for ch in (getattr(state, "extra_channels", None) or [])
+                if isinstance(ch, dict) and ch.get("id") and ch.get("key_b64") is not None
+            )
+        except Exception:
+            sig = ()
+
+        if sig == getattr(state, "_extra_channel_keys_sig", None):
+            return getattr(state, "_extra_channel_keys", []) or []
+
+        entries = []
+        for cid, name, key_b64 in sig:
+            try:
+                key_bytes = parseAESKey(key_b64)
+                h = _meshtastic_channel_hash(name, key_bytes)
+                entries.append({"id": cid, "hash": h, "key": key_bytes})
+            except Exception:
+                continue
+
+        state._extra_channel_keys_sig = sig
+        state._extra_channel_keys = entries
+        return entries
 
 def log_to_console(msg, style="info"):
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1184,8 +1500,23 @@ def load_languages():
     try:
         with open(path, "r", encoding="utf-8") as f:
             languages_data = json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        languages_data = {}  # tollerable, hardcoded english fallback
+    except json.JSONDecodeError as e:
         languages_data = {}
+        show_fatal_error(
+            f"{PROGRAM_NAME} — Language File Error",
+            f"The language file is corrupted and cannot be parsed:\n{path}\n\nError: {e}\n\n"
+            "The application will start in English.\n"
+            "Please re-download the language file from the GitHub repository."
+        )
+    except Exception as e:
+        languages_data = {}
+        show_fatal_error(
+            f"{PROGRAM_NAME} — Language File Error",
+            f"Could not read the language file:\n{path}\n\nError: {e}\n\n"
+            "The application will start in English."
+        )
 
 def get_available_languages():
     if not languages_data:
@@ -1242,16 +1573,50 @@ def load_user_config():
             return
         with open(path, "r") as f:
             data = json.load(f)
+    except json.JSONDecodeError as e:
+        show_fatal_error(
+            f"{PROGRAM_NAME} — Config File Error",
+            f"The configuration file is corrupted and will be ignored:\n{get_config_path()}\n\n"
+            f"Error: {e}\n\n"
+            "Default settings will be used.\n"
+            "You can delete/backup the config file and restart to reset all settings."
+        )
+        return
     except Exception as e:
         log_to_console(f"Config load error: {e}")
         return
     s = state
     v = data.get("direct_region")
     if isinstance(v, str):
-        s.direct_region = v
+        # EU_433, EU_868, US_915 -> US, ecc. (US_915 not exist anymore)
+        _old_region_map = {"US_915": "US"}
+        tv = _old_region_map.get(v, v)
+        if tv in MESHTASTIC_REGIONS:
+            s.direct_region = tv
     v = data.get("direct_preset")
     if isinstance(v, str):
-        s.direct_preset = v
+        # Backward compatibility: map old preset names to new ones
+        _old_to_new = {
+            "Medium Fast": "MEDIUM_FAST",
+            "Long Fast": "LONG_FAST",
+            "Medium Slow": "MEDIUM_SLOW",
+            "Long Slow (depr.)": "LONG_SLOW",
+            "Long Moderate": "LONG_MODERATE",
+            "Short Slow": "SHORT_SLOW",
+            "Short Fast": "SHORT_FAST",
+            "Short Turbo": "SHORT_TURBO",
+        }
+        _valid_presets = set(MESHTASTIC_MODEM_PRESETS.keys()) | {"ALL"}
+        s.direct_preset = _old_to_new.get(v, v if v in _valid_presets else "LONG_FAST")
+    v = data.get("direct_frequency_slot")
+    if v is not None:
+        try:
+            s.direct_frequency_slot = int(v)
+        except Exception:
+            pass
+    v = data.get("direct_channel_name")
+    if isinstance(v, str):
+        s.direct_channel_name = v
     v = data.get("direct_ppm")
     if v is not None:
         try:
@@ -1264,6 +1629,21 @@ def load_user_config():
             s.direct_gain = int(v)
         except Exception:
             pass
+    v = data.get("direct_device_args")
+    if isinstance(v, str):
+        tv = v.strip()
+        # Accept any valid osmosdr args pattern, just sanitize and store as-is
+        known_drivers = r"\b(rtl|hackrf|bladerf|airspy|airspyhf|uhd|soapy|miri|redpitaya|file|rtl_tcp)\s*="
+        if re.search(known_drivers, tv, flags=re.IGNORECASE):
+            s.direct_device_args = tv
+        elif tv == "":
+            s.direct_device_args = ""
+        else:
+            # Unknown but non-empty: store as-is, engine will validate
+            s.direct_device_args = tv
+    v = data.get("direct_bias_tee")
+    if isinstance(v, bool):
+        s.direct_bias_tee = v
     v = data.get("direct_port")
     if isinstance(v, str):
         s.direct_port = v
@@ -1298,6 +1678,33 @@ def load_user_config():
         global current_language, user_language_from_config
         current_language = v
         user_language_from_config = True
+    v = data.get("map_center_lat")
+    if v is not None:
+        try:
+            s.map_center_lat = float(v)
+        except Exception:
+            pass
+    v = data.get("map_center_lng")
+    if v is not None:
+        try:
+            s.map_center_lng = float(v)
+        except Exception:
+            pass
+    v = data.get("map_zoom")
+    if v is not None:
+        try:
+            s.map_zoom = int(v)
+        except Exception:
+            pass
+    v = data.get("extra_channels")
+    if isinstance(v, list):
+        s.extra_channels = [
+            ch for ch in v
+            if isinstance(ch, dict) and 'id' in ch and 'name' in ch and 'key_b64' in ch
+        ]
+    v = data.get("channels_order")
+    if isinstance(v, list):
+        s.channels_order = [x for x in v if isinstance(x, str)]
 
 def save_user_config():
     try:
@@ -1305,8 +1712,12 @@ def save_user_config():
         data = {
             "direct_region": state.direct_region,
             "direct_preset": state.direct_preset,
+            "direct_frequency_slot": state.direct_frequency_slot,
+            "direct_channel_name": state.direct_channel_name,
             "direct_ppm": state.direct_ppm,
             "direct_gain": state.direct_gain,
+            "direct_device_args": getattr(state, "direct_device_args", "rtl=0"),
+            "direct_bias_tee": getattr(state, "direct_bias_tee", False),
             "direct_port": state.direct_port,
             "direct_key_b64": state.direct_key_b64,
             "external_ip": state.external_ip,
@@ -1316,90 +1727,147 @@ def save_user_config():
             "verbose_logging": state.verbose_logging,
             "theme": getattr(state, "theme", "light"),
             "language": current_language,
+            "map_center_lat": getattr(state, "map_center_lat", None),
+            "map_center_lng": getattr(state, "map_center_lng", None),
+            "map_zoom": getattr(state, "map_zoom", None),
+            "extra_channels": getattr(state, 'extra_channels', []),
+            "channels_order": getattr(state, 'channels_order', []),
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
         log_to_console(f"Config save error: {e}")
 
-def check_linux_native_deps() -> bool:
-    if platform.system() != "Linux":
-        return True
-
+def check_native_runtime_deps() -> bool:
     import ctypes
+    system = platform.system()
 
-    # Required shared libs for QtWebEngine/Qt backend on Linux (Raspberry etc.)
-    required = [
-        ("libxcb-cursor.so.0", "libxcb-cursor0"),
-        ("libminizip.so.1", "libminizip1"),
-    ]
-
-    missing = []
-    for soname, pkg in required:
+    if system == "Windows":
+        win_ver = sys.getwindowsversion()
+        if win_ver.major < 10 or (win_ver.major == 10 and win_ver.build < 17763):
+            show_fatal_error(
+                f"{PROGRAM_NAME} — Unsupported Windows Version",
+                f"Your Windows version (build {win_ver.build}) is not supported.\n\n"
+                f"This application requires Windows 10 version 1809 (build 17763) (2018) or later.\n\n"
+                f"Please update Windows via Settings → Update & Security → Windows Update."
+            )
+            return False
+        webview2_missing = True
         try:
-            ctypes.CDLL(soname)
-        except OSError:
-            missing.append((soname, pkg))
+            import glob as _glob
+            _webview2_paths = [
+                r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application",
+                r"C:\Program Files\Microsoft\EdgeWebView\Application",
+                r"C:\Program Files (x86)\Microsoft\Edge\Application",
+                r"C:\Program Files\Microsoft\Edge\Application",
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "EdgeWebView", "Application"),
+                os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "Application"),
+            ]
+            for _base in _webview2_paths:
+                if not os.path.isdir(_base):
+                    continue
+                for _v in _glob.glob(os.path.join(_base, "*")):
+                    for _exe in ("msedgewebview2.exe", "msedge.exe"):
+                        if os.path.isfile(os.path.join(_v, _exe)):
+                            webview2_missing = False
+                            break
+                    if not webview2_missing:
+                        break
+                if not webview2_missing:
+                    break
 
-    if not missing:
+            # Fallback: check registry if WebView2 is installed
+            if webview2_missing:
+                import winreg as _winreg
+                _reg_paths = [
+                    (_winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+                    (_winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+                    (_winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"),
+                    (_winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\EdgeUpdate\Clients\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}"),
+                    (_winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}"),
+                ]
+                for _hive, _path in _reg_paths:
+                    try:
+                        k = _winreg.OpenKey(_hive, _path)
+                        _winreg.CloseKey(k)
+                        webview2_missing = False
+                        break
+                    except OSError:
+                        continue
+        except Exception:
+            webview2_missing = True
+
+        if webview2_missing:
+            show_fatal_error(
+                f"{PROGRAM_NAME} — Missing WebView2 Runtime",
+                f"Microsoft Edge WebView2 Runtime is not installed.\n\n"
+                f"This component is required to display the application interface.\n\n"
+                f"Please download and install it from:\n"
+                f"https://go.microsoft.com/fwlink/p/?LinkId=2124703\n"
+                f"(click 'Download' under 'Evergreen Bootstrapper' id needed)\n\n"
+                f"After installation, restart {PROGRAM_NAME}."
+            )
+            return False
         return True
 
-    missing_pkgs = sorted({pkg for _, pkg in missing})
-    missing_sonames = sorted({soname for soname, _ in missing})
-    pkg_list = " ".join(missing_pkgs)
-    soname_list = ", ".join(missing_sonames)
-
-    msg = (
-        f"Missing system libraries: {soname_list}\n"
-        "These packages are required to run the native GUI on Linux.\n"
-        "Install them with:\n"
-        f"  sudo apt-get update && sudo apt-get install -y {pkg_list}\n"
-        "Then restart this application."
-    )
-
-    if getattr(sys, "frozen", False):
-        # Try to show a friendly installer prompt in a terminal first
-        script = (
-            f"echo 'Missing system libraries: {soname_list}'; "
-            "echo; "
-            "echo 'These packages are required to run the native GUI.'; "
-            "echo; "
-            f"echo '  sudo apt-get update && sudo apt-get install -y {pkg_list}'; "
-            "echo; "
-            "read -p 'Install now? [Y/n] ' ans; "
-            "if [ \"$ans\" = \"\" ] || [ \"$ans\" = \"y\" ] || [ \"$ans\" = \"Y\" ]; then "
-            f"sudo apt-get update && sudo apt-get install -y {pkg_list}; "
-            "fi; "
-            "echo; "
-            "read -n1 -r -p 'Press any key to close this window...' key"
-        )
-
-        launched = False
-
-        terminal_attempts = [
-            ["x-terminal-emulator", "-e", "bash", "-lc", script],
-            ["xterm", "-e", "bash", "-lc", script],
-            # gnome-terminal prefers "--" on many distros
-            ["gnome-terminal", "--", "bash", "-lc", script],
-            ["konsole", "-e", "bash", "-lc", script],
+    if system == "Linux":
+        # Required shared libs for QtWebEngine/Qt backend on Linux (Raspberry etc.)
+        required = [
+            ("libxcb-cursor.so.0", "libxcb-cursor0"),
+            ("libminizip.so.1", "libminizip1"),
         ]
 
-        for cmd in terminal_attempts:
+        missing = []
+        for soname, pkg in required:
             try:
-                subprocess.Popen(cmd)
-                launched = True
-                break
-            except Exception:
-                continue
+                ctypes.CDLL(soname)
+            except OSError:
+                missing.append((soname, pkg))
 
-        if not launched:
-            # Fall back to GUI dialogs if terminals are not available
-            alert_cmds = [
-                ["zenity", "--info", "--title=Meshtastic GUI Analyzer", f"--text={msg}"],
-                ["kdialog", "--msgbox", msg, "--title", "Meshtastic GUI Analyzer"],
-                ["xmessage", "-center", msg],
+        if not missing:
+            return True
+
+        missing_pkgs = sorted({pkg for _, pkg in missing})
+        missing_sonames = sorted({soname for soname, _ in missing})
+        pkg_list = " ".join(missing_pkgs)
+        soname_list = ", ".join(missing_sonames)
+
+        msg = (
+            f"Missing system libraries: {soname_list}\n"
+            "These packages are required to run the native GUI on Linux.\n"
+            "Install them with:\n"
+            f"  sudo apt-get update && sudo apt-get install -y {pkg_list}\n"
+            "(or equivalent for your system) Then restart this application."
+        )
+
+        if getattr(sys, "frozen", False):
+            # Try to show a friendly installer prompt in a terminal first
+            script = (
+                f"echo 'Missing system libraries: {soname_list}'; "
+                "echo; "
+                "echo 'These packages are required to run the native GUI.'; "
+                "echo; "
+                f"echo '  sudo apt-get update && sudo apt-get install -y {pkg_list}'; "
+                "echo; "
+                "read -p 'Install now? [Y/n] ' ans; "
+                "if [ \"$ans\" = \"\" ] || [ \"$ans\" = \"y\" ] || [ \"$ans\" = \"Y\" ]; then "
+                f"sudo apt-get update && sudo apt-get install -y {pkg_list}; "
+                "fi; "
+                "echo; "
+                "read -n1 -r -p 'Press any key to close this window...' key"
+            )
+
+            launched = False
+
+            terminal_attempts = [
+                ["x-terminal-emulator", "-e", "bash", "-lc", script],
+                ["xterm", "-e", "bash", "-lc", script],
+                # gnome-terminal prefers "--" on many distros
+                ["gnome-terminal", "--", "bash", "-lc", script],
+                ["konsole", "-e", "bash", "-lc", script],
             ]
-            for cmd in alert_cmds:
+
+            for cmd in terminal_attempts:
                 try:
                     subprocess.Popen(cmd)
                     launched = True
@@ -1407,12 +1875,23 @@ def check_linux_native_deps() -> bool:
                 except Exception:
                     continue
 
-        if not launched:
-            print(msg, file=sys.stderr)
-    else:
-        print(msg, file=sys.stderr)
+            if not launched:
+                # Fall back to GUI dialogs if terminals are not available
+                try:
+                    show_fatal_error(f"{PROGRAM_NAME} — Missing libraries", msg)
+                    launched = True
+                except Exception:
+                    pass
 
-    return False
+            if not launched:
+                print(msg, file=sys.stderr)
+        else:
+            print(msg, file=sys.stderr)
+
+        return False
+    # Others/nothing
+
+    return True
 
 def get_resource_path(relative_path):
     try:
@@ -1492,7 +1971,8 @@ def update_node(node_id, **kwargs):
             "snr_indirect": None, "rssi_indirect": None,
             "hops": None, "hop_label": None,
             "temperature": None, "relative_humidity": None, "barometric_pressure": None,
-            "channel_utilization": None, "air_util_tx": None, "uptime_seconds": None
+            "channel_utilization": None, "air_util_tx": None, "uptime_seconds": None,
+            "preset": None,
         }
         state.nodes_updated = True
         state.nodes_list_updated = True # Ensure new nodes appear immediately
@@ -1540,7 +2020,7 @@ def update_node(node_id, **kwargs):
         if changed and ('short_name' in kwargs or 'long_name' in kwargs):
             state.chat_force_refresh = True
 
-def decodeProtobuf(packetData, sourceID, destID, cryptplainprefix, *, count_invalid: bool = True):
+def decodeProtobuf(packetData, sourceID, destID, cryptplainprefix, *, count_invalid: bool = True, preset_name: str | None = None, channel_hash: int | None = None, forced_channel_id: str | None = None, packet_id: bytes | None = None):
     try:
         data = mesh_pb2.Data()
         data.ParseFromString(packetData)
@@ -1573,7 +2053,9 @@ def decodeProtobuf(packetData, sourceID, destID, cryptplainprefix, *, count_inva
     if data.portnum == 1: # TEXT_MESSAGE_APP
         text = data.payload.decode('utf-8', errors='ignore')
         
-        if msg_id is not None and msg_id != 0:
+        if packet_id is not None and len(packet_id) > 0:
+            dedup_key = (sourceID, "PID", bytes(packet_id))
+        elif msg_id is not None and msg_id != 0:
             dedup_key = (sourceID, "MID", msg_id)
         else:
             dedup_key = (sourceID, text)
@@ -1608,13 +2090,70 @@ def decodeProtobuf(packetData, sourceID, destID, cryptplainprefix, *, count_inva
             "time": now_dt.strftime("%H:%M"),
             "date": now_dt.strftime("%d/%m/%Y"),
             "from": sender_name,
-            "from_id": sourceID, # Store ID for dynamic name resolution
+            "from_id": sourceID,
             "to": destID,
             "text": text,
-            "is_me": False # We are just a listener for now
+            "is_me": False,
+            "preset": preset_name
         }
-        state.messages.append(msg_obj)
-        state.new_messages.append(msg_obj)
+
+        # calculate default channel hash
+        default_ch_name = getattr(state, 'direct_channel_name', '') or ''
+        if not default_ch_name:
+            # use preset name as Meshtastic does
+            from meshtastic import mesh_pb2 as _mpb
+            default_ch_name = MESHTASTIC_MODEM_PRESETS.get(
+                getattr(state, 'direct_preset', 'LONG_FAST'), {}
+            ).get('channel_name', 'LongFast')
+        default_hash = _meshtastic_channel_hash(default_ch_name, getattr(state, "aes_key_bytes", b""))
+
+        # Route message to correct channel
+        routed = False
+        if forced_channel_id:
+            for ch in state.extra_channels:
+                if ch.get('id') == forced_channel_id:
+                    ch_id = forced_channel_id
+                    if ch_id not in state.channel_messages:
+                        state.channel_messages[ch_id] = deque(maxlen=100)
+                    state.channel_messages[ch_id].append(msg_obj)
+                    if state.active_channel_id != ch_id:
+                        state.channel_unread[ch_id] = True
+                        try:
+                            state.channel_unread_count[ch_id] = int(state.channel_unread_count.get(ch_id, 0)) + 1
+                        except Exception:
+                            state.channel_unread_count[ch_id] = 1
+                    routed = True
+                    break
+
+        if not routed and channel_hash is not None:
+            for ent in _get_extra_channel_keys():
+                if ent.get("hash") == channel_hash:
+                    ch_id = str(ent.get("id") or "")
+                    if not ch_id:
+                        continue
+                    if ch_id not in state.channel_messages:
+                        state.channel_messages[ch_id] = deque(maxlen=100)
+                    state.channel_messages[ch_id].append(msg_obj)
+                    if state.active_channel_id != ch_id:
+                        state.channel_unread[ch_id] = True
+                        try:
+                            state.channel_unread_count[ch_id] = int(state.channel_unread_count.get(ch_id, 0)) + 1
+                        except Exception:
+                            state.channel_unread_count[ch_id] = 1
+                    routed = True
+                    break
+
+        # If not routed to extra channel, route to default channel
+        if not routed:
+            state.messages.append(msg_obj)
+            state.new_messages.append(msg_obj)
+            if state.active_channel_id != 'default':
+                state.channel_unread['default'] = True
+                try:
+                    state.channel_unread_count['default'] = int(state.channel_unread_count.get('default', 0)) + 1
+                except Exception:
+                    state.channel_unread_count['default'] = 1
+
         log_msg = f"{cryptplainprefix} TEXT MSG from {sourceID}: {text}"
         update_node(sourceID)
         
@@ -1799,9 +2338,6 @@ def decodeProtobuf(packetData, sourceID, destID, cryptplainprefix, *, count_inva
 # --- FRAME PARSER ---
 def parse_framed_stream_bytes(rx_buf: bytearray):
     # Parse frames [type:1][len:2][payload:len] from rx_buf and process them.
-    def _i16_from_be(b0, b1):
-        v = (b0 << 8) | b1
-        return v - 0x10000 if v & 0x8000 else v
 
     while True:
         if len(rx_buf) < 3:
@@ -1843,6 +2379,10 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
                 has_metrics = (flags & 0x01) != 0
                 snr_val = (snr10 / 10.0) if has_metrics else None
                 rssi_val = (rssi10 / 10.0) if has_metrics else None
+                # preset_id: optional trailing byte (retrocompatible)
+                preset_id_off = flags_off + 5  # flags(1)+snr(2)+rssi(2)
+                frame_preset_id = body[preset_id_off] if len(body) > preset_id_off else 0
+                frame_preset_name = PRESET_ID_MAP.get(frame_preset_id)
 
                 # 1) Extract Meshtastic fields
                 extracted = dataExtractor(payload.hex())
@@ -1872,6 +2412,10 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
 
                 mesh_stats.on_frame_ok()
 
+                # Channel hash parsing
+                ch_hash_byte = extracted.get('channelHash', None)
+                channel_hash_int = ch_hash_byte[0] if isinstance(ch_hash_byte, (bytes, bytearray)) and ch_hash_byte else None
+
                 # 2) Decode IDs Before decrypting
                 s_id = msb2lsb(extracted['sender'].hex())
                 d_id = msb2lsb(extracted['dest'].hex())
@@ -1889,31 +2433,65 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
                 info = None
                 decrypted_ok = False
                 plaintext_ok = False
-                
+
+                candidates: list[tuple[bytes, str | None]] = []
+                used_forced_channel_id: str | None = None
                 try:
-                    decrypted = dataDecryptor(extracted, state.aes_key_bytes)
-                    info = decodeProtobuf(decrypted, s_id_fmt, d_id_fmt, "[DECRYPTED]", count_invalid=False)
-                    
-                    # If protobuf parsing succeeds, packet was encrypted
-                    if info and not str(info).startswith("INVALID PROTOBUF"):
-                        decrypted_ok = True
-                        pass
-                    else:
-                        # Protobuf parsing failed, try plaintext
-                        raise ValueError("Protobuf parse failed, trying plaintext")
-                        
+                    extra_keys = _get_extra_channel_keys()
+                    if channel_hash_int is not None:
+                        for ent in extra_keys:
+                            if ent.get("hash") == channel_hash_int and isinstance(ent.get("key"), (bytes, bytearray)):
+                                candidates.append((bytes(ent["key"]), str(ent.get("id") or "") or None))
+                    if isinstance(state.aes_key_bytes, (bytes, bytearray)):
+                        candidates.append((bytes(state.aes_key_bytes), None))
+                    for ent in extra_keys:
+                        k = ent.get("key")
+                        if isinstance(k, (bytes, bytearray)):
+                            kb = bytes(k)
+                            if not any(existing_k == kb for existing_k, _ in candidates):
+                                candidates.append((kb, None))
                 except Exception:
-                    # Decryption failed, try plaintext
+                    if isinstance(state.aes_key_bytes, (bytes, bytearray)):
+                        candidates = [(bytes(state.aes_key_bytes), None)]
+
+                for key_bytes, forced_id in candidates:
                     try:
-                        raw_data = extracted['data']  # Use raw data
-                        info = decodeProtobuf(raw_data, s_id_fmt, d_id_fmt, "[UNENCRYPTED]", count_invalid=False)
-                        
+                        decrypted = dataDecryptor(extracted, key_bytes)
+                        info = decodeProtobuf(
+                            decrypted,
+                            s_id_fmt,
+                            d_id_fmt,
+                            "[DECRYPTED]",
+                            count_invalid=False,
+                            preset_name=frame_preset_name,
+                            channel_hash=channel_hash_int,
+                            forced_channel_id=forced_id,
+                            packet_id=extracted.get('packetID'),
+                        )
+                        if info and not str(info).startswith("INVALID PROTOBUF"):
+                            decrypted_ok = True
+                            used_forced_channel_id = forced_id
+                            break
+                    except Exception:
+                        continue
+
+                if not decrypted_ok:
+                    try:
+                        raw_data = extracted['data']
+                        info = decodeProtobuf(
+                            raw_data,
+                            s_id_fmt,
+                            d_id_fmt,
+                            "[UNENCRYPTED]",
+                            count_invalid=False,
+                            preset_name=frame_preset_name,
+                            channel_hash=channel_hash_int,
+                            packet_id=extracted.get('packetID'),
+                        )
                         if info and not str(info).startswith("INVALID PROTOBUF"):
                             plaintext_ok = True
-                            pass
                         else:
                             info = None
-                            
                     except Exception as e2:
                         log_to_console(f"[ERROR] Complete parse failure: {e2}")
                         info = None
@@ -1937,7 +2515,8 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
                 
                 # 4) Store metrics if available
                 if info:
-                    log_to_console(info)
+                    preset_tag = f" -- Preset: {frame_preset_name}" if frame_preset_name else ""
+                    log_to_console(f"{info}{preset_tag}")
                 
                 if info and not str(info).startswith("INVALID PROTOBUF"):
                     if hops_val is not None or hop_label is not None:
@@ -1948,6 +2527,7 @@ def parse_framed_stream_bytes(rx_buf: bytearray):
                             update_node(s_id_fmt, snr=snr_val, rssi=rssi_val)
                         else:
                             update_node(s_id_fmt, snr_indirect=snr_val, rssi_indirect=rssi_val)
+                    update_node(s_id_fmt, preset=frame_preset_name)
 
             except Exception as e:
                 try:
@@ -1975,16 +2555,11 @@ def zmq_worker():
     except Exception as e:
         log_to_console(f"Connection Failed: {e}")
         if state.connected and state.connect_mode == "external":
-            stop_connection()
+            _request_stop_connection_from_thread()
         return
 
     # Buffer for reconstructing frames (type+len+data) even if split across multiple recv()
     rx_buf = bytearray()
-
-    def _i16_from_be(b0, b1):
-        # Decode signed int16 from big-endian bytes
-        v = (b0 << 8) | b1
-        return v - 0x10000 if v & 0x8000 else v
 
     while state.connected and state.connect_mode == "external":
         try:
@@ -2007,7 +2582,7 @@ def zmq_worker():
             
     log_to_console("Disconnected.")
     if state.connected and state.connect_mode == "external":
-        stop_connection()
+        _request_stop_connection_from_thread()
 
 # --- TCP WORKER ---
 
@@ -2053,7 +2628,7 @@ def tcp_worker():
     if s is None:
         log_to_console("[INTERNAL] Giving up TCP connection to engine")
         if state.connected and state.connect_mode == "direct":
-            stop_connection()
+            _request_stop_connection_from_thread()
         return
 
     log_to_console("[INTERNAL] TCP connected (waiting for data...)")
@@ -2080,7 +2655,7 @@ def tcp_worker():
 
     log_to_console("[INTERNAL] TCP worker stopped")
     if state.connected and state.connect_mode == "direct":
-        stop_connection()
+        _request_stop_connection_from_thread()
 
 # Start/Stop internal radio engine
 
@@ -2101,7 +2676,7 @@ def show_rtlsdr_device_error_dialog():
     with ui.dialog() as dlg, ui.card().classes('w-110'):
         ui.label(translate("popup.error.rtlsdrdevice.title", "SDR Device Error")).classes('text-lg font-bold mb-2 text-red-600')
         ui.label(
-            translate("popup.error.rtlsdrdevice.body1", "Wrong RTL-SDR device index was reported by the internal engine.")
+            translate("popup.error.rtlsdrdevice.body1", "Wrong RTL-SDR device index or no supported devices found was reported by the internal engine.")
         ).classes('text-sm text-gray-800 mb-2')
         ui.label(
             translate("popup.error.rtlsdrdevice.body2", "Please connect a compatible RTL-SDR dongle and install the correct drivers for your operating system (Windows or Linux).")
@@ -2231,53 +2806,25 @@ def ensure_conda_unpacked(runtime: str, system: str) -> None:
         # Don't crash silently: bubble up so caller can show dialog
         raise RuntimeError(f"conda-unpack error: {e}")
 
-def start_engine_direct():
-    if state.engine_proc is not None and state.engine_proc.poll() is None:
-        return
-
+def list_internal_sdr_devices() -> tuple[list[tuple[str, str]], str | None]:
     try:
         engine_dir, runtime, py, system = _engine_paths()
     except Exception as e:
-        msg = (
-            "Internal SDR engine could not be started: "
-            f"{e}."
-        )
-        log_to_console(f"[ENGINE] {msg}")
-        show_engine_error_dialog(msg)
-        state.engine_proc = None
-        return
+        return [], str(e)
 
     if not os.path.isdir(engine_dir):
-        msg = (
-            "Internal SDR engine could not be started: no 'engine' folder found."
-        )
-        log_to_console(f"[ENGINE] {msg}")
-        show_engine_error_dialog(msg)
-        state.engine_proc = None
-        return
+        return [], "no_engine_dir"
 
     if not os.path.isdir(runtime) or not os.path.isfile(py):
-        msg = (
-            "Internal SDR engine could not be started: engine runtime for this "
-            "platform is missing or incomplete."
-        )
-        log_to_console(f"[ENGINE] {msg}")
-        show_engine_error_dialog(msg)
-        state.engine_proc = None
-        return
+        return [], "no_runtime"
 
     try:
         ensure_conda_unpacked(runtime, system)
     except Exception as e:
-        msg = f"Internal SDR engine could not prepare portable runtime: {e}"
-        log_to_console(f"[ENGINE] {msg}")
-        show_engine_error_dialog(msg)
-        state.engine_proc = None
-        return
-        
+        return [], str(e)
+
     env = os.environ.copy()
     env["PYTHONPATH"] = engine_dir
-
     if system == "Windows":
         env["PATH"] = (
             f"{os.path.join(runtime,'Library','bin')};"
@@ -2286,59 +2833,233 @@ def start_engine_direct():
             f"{env.get('PATH','')}"
         )
     else:
-        # macOS/Linux: no DYLD_LIBRARY_PATH!
+        env["PATH"] = f"{os.path.join(runtime,'bin')}:{env.get('PATH','')}"
+        env["CONDA_PREFIX"] = runtime
+        env["PYTHONNOUSERSITE"] = "1"
+
+    if DEBUGGING:
+        log_to_console(f"[SDRSCAN] start py={py}")
+
+    # Probe each known osmosdr driver type separately
+    DRIVER_PROBES = [
+        ("rtl",      "rtl={idx}"),
+        ("hackrf",   "hackrf={idx}"),
+        ("bladerf",  "bladerf={idx}"),
+        ("airspy",   "airspy={idx}"),
+        ("airspyhf", "airspyhf={idx}"),
+        ("uhd",      "uhd={idx}"),
+        ("soapy",    "soapy={idx}"),
+    ]
+
+    probe_code_tpl = (
+        "import json, sys\n"
+        "args = sys.argv[1]\n"
+        "try:\n"
+        " import osmosdr\n"
+        " s = osmosdr.source(args='numchan=1 ' + args)\n"
+        " try:\n"
+        "  s.set_sample_rate(1_000_000)\n"
+        " except Exception:\n"
+        "  pass\n"
+        " print(json.dumps({'ok': True}))\n"
+        "except Exception as e:\n"
+        " print(json.dumps({'ok': False, 'error': str(e)}))\n"
+        " sys.exit(1)\n"
+    )
+
+    results: list[tuple[str, str]] = []
+    scan_errors = []
+
+    _cf = subprocess.CREATE_NO_WINDOW if (os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW")) else 0
+
+    for driver, args_pattern in DRIVER_PROBES:
+        for idx in range(0, 4):  # try idx 0..3 per driver
+            dev_args = args_pattern.format(idx=idx)
+            try:
+                p = subprocess.run(
+                    [py, "-c", probe_code_tpl, dev_args],
+                    cwd=engine_dir,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=300,
+                    creationflags=_cf,
+                )
+            except Exception as e:
+                scan_errors.append(f"{dev_args}: {e}")
+                if DEBUGGING:
+                    log_to_console(f"[SDRSCAN] exception probing {dev_args}: {e}")
+                break  # if subprocess itself fails, skip rest of driver
+
+            stderr_out = (p.stderr or "").strip()
+            stdout_out = (p.stdout or "").strip()
+
+            if DEBUGGING:
+                log_to_console(f"[SDRSCAN] probe {dev_args} rc={p.returncode} stdout={stdout_out[:120]} stderr={stderr_out[:120]}")
+
+            if p.returncode != 0:
+                # No device at this index, stop trying higher indexes for this driver
+                err_line = stderr_out.splitlines()[0][:300] if stderr_out else ""
+                if err_line:
+                    scan_errors.append(f"{dev_args}: {err_line}")
+                break
+
+            # Parse device name/serial from osmosdr stderr
+            name = None
+            sn = None
+            m = re.search(
+                r"Using device #\d+[:\s]+(.+?)(?:\s+SN[:\s]*([^\r\n]+))?(?:\r?\n|$)",
+                stderr_out, flags=re.MULTILINE
+            )
+            if m:
+                name = (m.group(1) or "").strip()
+                sn = (m.group(2) or "").strip() or None
+
+            label = f"{driver.upper()} #{idx}"
+            if name:
+                label = f"{name} #{idx}"
+            if sn:
+                label += f" (SN: {sn})"
+
+            results.append((dev_args, label))
+            # Found device at idx, continue to next idx
+
+    if DEBUGGING:
+        log_to_console(f"[SDRSCAN] final results={results} errors={scan_errors[:5]}")
+
+    if results:
+        return results, None
+    return [], None
+
+def start_engine_direct():
+    if state.engine_proc is not None and state.engine_proc.poll() is None:
+        return
+
+    try:
+        engine_dir, runtime, py, system = _engine_paths()
+    except Exception as e:
+        msg = f"Internal SDR engine could not be started: {e}."
+        log_to_console(f"[ENGINE] {msg}")
+        show_engine_error_dialog(msg)
+        return
+
+    if not os.path.isdir(engine_dir):
+        msg = "Internal SDR engine could not be started: no 'engine' folder found."
+        log_to_console(f"[ENGINE] {msg}")
+        show_engine_error_dialog(msg)
+        return
+
+    if not os.path.isdir(runtime) or not os.path.isfile(py):
+        msg = "Internal SDR engine could not be started: engine runtime missing or incomplete."
+        log_to_console(f"[ENGINE] {msg}")
+        show_engine_error_dialog(msg)
+        return
+
+    try:
+        ensure_conda_unpacked(runtime, system)
+    except Exception as e:
+        msg = f"Internal SDR engine could not prepare portable runtime: {e}"
+        log_to_console(f"[ENGINE] {msg}")
+        show_engine_error_dialog(msg)
+        return
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = engine_dir
+    if system == "Windows":
+        env["PATH"] = (f"{os.path.join(runtime,'Library','bin')};{os.path.join(runtime,'Scripts')};{runtime};{env.get('PATH','')}")
+    else:
         env["PATH"] = f"{os.path.join(runtime,'bin')}:{env.get('PATH','')}"
         env["CONDA_PREFIX"] = runtime
         env["PYTHONNOUSERSITE"] = "1"
 
     region = getattr(state, "direct_region", "EU_868")
     preset_name = state.direct_preset
+    freq_slot = getattr(state, "direct_frequency_slot", 0)
+    ch_name = getattr(state, "direct_channel_name", "") or None
+
+    raw_device_args = str(getattr(state, "direct_device_args", "") or "").strip()
+    device_args = raw_device_args
+    if raw_device_args and not re.search(r"\b(rtl|hackrf|bladerf|uhd|soapy|airspy|plutosdr|lime)=", raw_device_args, flags=re.IGNORECASE):
+        log_to_console(f"[ENGINE] Passing through unrecognized device args: {raw_device_args}")
     try:
-        cfg = LORA_PRESETS[preset_name][region]
-        center_freq = cfg["center_freq"]
-        samp_rate = cfg["samp_rate"]
-        lora_bw = cfg["lora_bw"]
-        sf = cfg["sf"]
+        avail = getattr(state, "direct_device_detected_args", None)
+        if device_args and isinstance(avail, list) and avail and device_args not in avail:
+            log_to_console(f"[ENGINE] Selected device not available: {device_args}; falling back to auto")
+            device_args = ""
+            state.direct_device_args = ""
+            save_user_config()
     except Exception:
-        msg = f"Invalid preset/region combination: {preset_name} / {region}"
+        pass
+
+    # --- Build preset configs (unified: single or ALL) ---
+    if preset_name == "ALL":
+        all_presets = list(MESHTASTIC_MODEM_PRESETS.keys())
+    else:
+        all_presets = [preset_name]
+
+    valid_configs = []
+    primary = None
+    for pk in all_presets:
+        pid = PRESET_ID_REVERSE.get(pk, 0)
+        calc = meshtastic_calc_freq(region, pk, freq_slot, ch_name)
+        if not calc.get("valid"):
+            log_to_console(f"[ENGINE] Skipping {pk}: {calc.get('error')}")
+            continue
+        entry = {
+            "sf": calc["sf"],
+            "bw": int(round(calc["bw_khz"] * 1000)),
+            "center_freq": calc["center_freq_hz"],
+            "preset_id": pid,
+        }
+        if primary is None:
+            primary = (pk, pid, calc, entry)
+        else:
+            valid_configs.append(entry)
+
+    if primary is None:
+        msg = f"No valid preset found for region {region}."
         log_to_console(f"[ENGINE] {msg}")
         show_engine_error_dialog(msg)
-        state.engine_proc = None
         return
+
+    primary_key, primary_preset_id, primary_calc, _ = primary
+    log_to_console(f"[ENGINE] Primary: {primary_key} (preset_id={primary_preset_id}), extra chains: {len(valid_configs)}")
 
     cmd = [
         py, "-m", "meshtastic_engine.run_engine",
         "--host", "127.0.0.1",
         "--port", str(state.port),
-        "--device-args", "rtl=0",
-        "--center-freq", str(center_freq),
-        "--samp-rate",   str(samp_rate),
-        "--lora-bw",     str(lora_bw),
-        "--sf",          str(sf),
-        "--gain",        str(int(state.direct_gain)),
-        "--ppm",         str(int(state.direct_ppm)),
+        "--center-freq", str(primary_calc["center_freq_hz"]),
+        "--samp-rate", "1000000",
+        "--lora-bw", str(int(round(primary_calc["bw_khz"] * 1000))),
+        "--sf", str(primary_calc["sf"]),
+        "--gain", str(int(state.direct_gain)),
+        "--ppm", str(int(state.direct_ppm)),
+        "--preset-id", str(primary_preset_id),
     ]
+    if valid_configs:
+        import json as _json
+        cmd.extend(["--extra-demod-configs", _json.dumps(valid_configs)])
+    if device_args:
+        cmd.extend(["--device-args", device_args])
+    if getattr(state, 'direct_bias_tee', False):
+        cmd.append("--bias-tee")
+
+    log_to_console(f"[ENGINE] Radio settings: freq={primary_calc['center_freq_hz']}, bw={int(round(primary_calc['bw_khz']*1000))}, sf={primary_calc['sf']}")
 
     try:
         creationflags = 0
         if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
             creationflags = subprocess.CREATE_NO_WINDOW
         state.engine_proc = subprocess.Popen(
-            cmd,
-            cwd=engine_dir,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
+            cmd, cwd=engine_dir, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, universal_newlines=True,
             creationflags=creationflags,
         )
     except Exception as e:
-        msg = (
-            "Internal SDR engine failed to start: "
-            f"{e}."
-        )
+        msg = f"Internal SDR engine failed to start: {e}."
         log_to_console(f"[ENGINE] {msg}")
         show_engine_error_dialog(msg)
         state.engine_proc = None
@@ -2348,13 +3069,14 @@ def start_engine_direct():
         rtlsdr_notified = False
         ansi_re = re.compile(r"\x1b\[[0-9;]*m")
         last_rx_msg_bytes = None
+        _noise_re = re.compile(r"allocate_buffer: tried to allocate")
 
         def _parse_engine_rx_msg(s: str) -> bytes | None:
             try:
                 idx = s.find("rx msg:")
                 if idx < 0:
                     return None
-                payload = s[idx + len("rx msg:") :].strip()
+                payload = s[idx + len("rx msg:"):].strip()
                 if not payload:
                     return None
                 parts = [p.strip() for p in payload.split(",")]
@@ -2362,10 +3084,7 @@ def start_engine_direct():
                 for p in parts:
                     if not p:
                         continue
-                    if p.lower().startswith("0x"):
-                        v = int(p, 16)
-                    else:
-                        v = int(p, 10)
+                    v = int(p, 16) if p.lower().startswith("0x") else int(p, 10)
                     if v < 0 or v > 255:
                         return None
                     out.append(v)
@@ -2376,33 +3095,54 @@ def start_engine_direct():
         try:
             for line in state.engine_proc.stdout:
                 line = line.rstrip("\n")
-                if line:
-                    log_to_console(f"[ENGINE] {line}")
-                    plain = ansi_re.sub("", line)
-                    if "rx msg:" in plain:
-                        last_rx_msg_bytes = _parse_engine_rx_msg(plain)
-                    if "CRC invalid" in plain:
-                        try:
-                            if last_rx_msg_bytes:
-                                extracted = dataExtractor(last_rx_msg_bytes.hex())
-                                mesh_stats.mark_crc_invalid_packet(extracted.get("sender"), extracted.get("packetID"))
-                                last_rx_msg_bytes = None
-                            mesh_stats.on_frame_fail()
-                        except Exception:
-                            pass
-                    if (not rtlsdr_notified) and "Wrong rtlsdr device index" in line:
-                        rtlsdr_notified = True
-                        state.rtlsdr_error_pending = True
-                        state.rtlsdr_error_text = line
-
+                if not line:
+                    continue
+                if _noise_re.search(line):
+                    continue
+                log_to_console(f"[ENGINE] {line}")
+                plain = ansi_re.sub("", line)
+                if "rx msg:" in plain:
+                    last_rx_msg_bytes = _parse_engine_rx_msg(plain)
+                if "CRC invalid" in plain:
+                    try:
+                        if last_rx_msg_bytes:
+                            extracted = dataExtractor(last_rx_msg_bytes.hex())
+                            mesh_stats.mark_crc_invalid_packet(extracted.get("sender"), extracted.get("packetID"))
+                            last_rx_msg_bytes = None
+                        mesh_stats.on_frame_fail()
+                    except Exception:
+                        pass
+                if (not rtlsdr_notified) and ("Wrong rtlsdr device index" in line or "No supported devices found" in line):
+                    rtlsdr_notified = True
+                    state.rtlsdr_error_pending = True
+                    state.rtlsdr_error_text = line
         except Exception:
             pass
-        rc = state.engine_proc.poll()
+
+        rc = state.engine_proc.poll() if state.engine_proc else None
+        if rc is not None and DEBUGGING:
+            print(f"DEBUG: ENGINE PROCESS EXITED rc={rc}", flush=True)
         if rc is not None and state.connected and state.connect_mode == "direct":
-            # engine crashed while we were in direct mode
             log_to_console(f"[ENGINE] EXIT code={rc}")
-            ui.notify(translate("notification.error.enginecrash", "Engine crashed/exited (code {code})".format(code=rc)), color="negative")
-            stop_connection()
+            try:
+                loop = MAIN_LOOP
+                if loop and loop.is_running():
+                    msg = translate("notification.error.enginecrash", "Engine crashed/exited (code {code})").format(code=rc)
+                    
+                    def safe_notify(m):
+                        # This try to iterates over all active clients (in native mode there is only one but for security and compatibility we iterate)
+                        try:
+                            clients = app.clients() if callable(app.clients) else app.clients
+                        except Exception:
+                            clients = []
+                        for client in clients:
+                            with client:
+                                ui.notify(m, color="negative")
+                    
+                    loop.call_soon_threadsafe(safe_notify, msg)
+                    loop.call_soon_threadsafe(stop_connection)
+            except Exception:
+                _request_stop_connection_from_thread()
 
     threading.Thread(target=_pump, daemon=True).start()
 
@@ -2419,7 +3159,6 @@ def stop_engine_direct():
     except Exception:
         pass
     state.engine_proc = None
-
 
 def start_connection(mode: str):
     if state.connected:
@@ -2449,17 +3188,115 @@ def stop_connection():
     state.connect_mode = None
     set_connection_status_ui(False, mode)
 
-def close_pyinstaller_splash():
-    if getattr(sys, 'frozen', False):
-        splash_anim_state['running'] = False
+def _request_stop_connection_from_thread():
+    """Thread-safe: schedule stop_connection in the primary asyncio loop."""
+    try:
+        loop = MAIN_LOOP
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(stop_connection)
+        else:
+            stop_connection()
+    except Exception:
+        # minimal fallback without touching UI
+        state.connected = False
+        state.connect_mode = None
+
+_splash_process = None
+
+def _run_splash_process():
+    """Function that runs the tk splash screen in a separate process."""
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.overrideredirect(True)
+        root.attributes('-topmost', True)
+        root.configure(bg='#0b1220')
+        W, H = 520, 280
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        x = (sw - W) // 2
+        y = (sh - H) // 2
+        root.geometry(f"{W}x{H}+{x}+{y}")
+
+        canvas = Canvas(root, width=W, height=H, bg='#0b1220', highlightthickness=0)
+        canvas.pack(fill='both', expand=True)
+
+        canvas.create_rectangle(2, 2, W-2, H-2, outline='#1e3a5f', width=2)
+        canvas.create_text(W//2, 90, text=PROGRAM_NAME, fill='#ffffff', font=('Helvetica', 28, 'bold'))
+        canvas.create_text(W//2, 130, text=f"v{VERSION}  by {AUTHOR}", fill='#94a3b8', font=('Helvetica', 13))
+
+        BAR_W, BAR_H = 360, 6
+        BAR_X = (W - BAR_W) // 2
+        BAR_Y = 200
+        canvas.create_rectangle(BAR_X, BAR_Y, BAR_X+BAR_W, BAR_Y+BAR_H, fill='#1e3a5f', outline='')
+        seg = canvas.create_rectangle(BAR_X, BAR_Y, BAR_X, BAR_Y+BAR_H, fill='#3b82f6', outline='')
+        canvas.create_text(W//2, BAR_Y+28, text='Loading...', fill='#64748b', font=('Helvetica', 11))
+
+        pos = [0]
+        direction = [1]
+        SEG_LEN = 80
+        
+        def animate():
+            pos[0] += direction[0] * 4
+            if pos[0] + SEG_LEN >= BAR_W:
+                pos[0] = BAR_W - SEG_LEN
+                direction[0] = -1
+            elif pos[0] <= 0:
+                pos[0] = 0
+                direction[0] = 1
+
+            canvas.coords(seg, BAR_X+pos[0], BAR_Y, BAR_X+pos[0]+SEG_LEN, BAR_Y+BAR_H)
+            root.after(16, animate)
+
+        animate()
+        root.mainloop()
+    except:
+        pass
+
+def start_tk_splash():
+    global _splash_process
+    # Close Pyinstaller splash if open
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
+    if _splash_process: return
+    try:
+        # Launch the splash screen in a separate process
+        _splash_process = multiprocessing.Process(target=_run_splash_process, daemon=True)
+        _splash_process.start()
+    except Exception as e:
+        print(f"Splash failed: {e}")
+
+def close_tk_splash():
+    global _splash_process
+    if _splash_process:
         try:
-            import pyi_splash
-            pyi_splash.close()
-        except Exception:
-            pass
+            if _splash_process.is_alive():
+                _splash_process.terminate() # Politically ask the process to close
+                _splash_process.join(timeout=0.2)
+                if _splash_process.is_alive():
+                    _splash_process.kill() # Force close if still alive
+        except Exception as e:
+            print(f"Error closing splash process: {e}")
+        finally:
+            _splash_process = None
+
+def close_all_splash():
+    """Closes both the PyInstaller legacy splash and the tk cross-platform splash."""
+    close_tk_splash() 
+    try:
+        import pyi_splash
+        pyi_splash.close()
+    except Exception:
+        pass
 
 @app.post('/shutdown_app')
 async def shutdown_app(request: Request):
+    # Shutdown via beacon only on macOS (on other OS pywebview handles the lifecycle)
+    if platform.system() != 'Darwin':
+        return {'status': 'ignored'}
     token = request.query_params.get('token')
     if token != SHUTDOWN_TOKEN:
         return {'status': 'ignored'}
@@ -2483,6 +3320,27 @@ async def set_theme(request: Request):
             state.chat_force_refresh = True
             save_user_config()
             return {'status': 'ok'}
+    return {'status': 'ignored'}
+
+@app.post('/set_map_center')
+async def set_map_center(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    lat = data.get('lat') if isinstance(data, dict) else None
+    lng = data.get('lng') if isinstance(data, dict) else None
+    zoom = data.get('zoom') if isinstance(data, dict) else None
+    try:
+        if lat is not None and lng is not None:
+            state.map_center_lat = float(lat)
+            state.map_center_lng = float(lng)
+            if zoom is not None:
+                state.map_zoom = int(zoom)
+            save_user_config()
+            return {'status': 'ok'}
+    except Exception:
+        pass
     return {'status': 'ignored'}
 
 # --- GUI ---
@@ -2512,11 +3370,74 @@ def main_page():
             });
             </script>
         ''')
-    else:
-        close_pyinstaller_splash() # useless on MacOS (splash not working)
+    close_all_splash()
 
     # Style
     ui.add_head_html(f'<script>window.mesh_initial_theme = {json.dumps(getattr(state, "theme", "light"))};</script>')
+    ui.add_head_html('''
+        <style>
+        .device-row { overflow: hidden !important; }
+        .device-row { width: 100% !important; }
+        .device-select-wrap { min-width: 0 !important; overflow: hidden !important; }
+        .device-select { min-width: 0 !important; max-width: 100% !important; width: 100% !important; }
+        .device-select .q-field__control { min-width: 0 !important; }
+        .device-select .q-field__control-container { min-width: 0 !important; }
+        .device-select .q-field__native { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .bias-tee-cb .q-checkbox__bg { border-color: white !important; }
+        .channel-tab-btn { 
+            border-radius: 0 !important; 
+            min-width: fit-content;
+            white-space: nowrap;
+        }
+        .mesh-dark .channel-tab-btn { 
+            color: #94a3b8 !important; 
+        }
+        .mesh-dark .channel-tab-btn.border-blue-500 { 
+            color: #60a5fa !important; 
+        }
+        .channel-tabs-row {
+            scrollbar-width: none !important;
+            -ms-overflow-style: none !important;
+            overflow-x: auto !important;
+            overflow-y: visible !important;
+            scroll-behavior: smooth;
+        }
+        .channel-tabs-row::-webkit-scrollbar {
+            display: none !important;
+        }
+        .channel-tabs-wrapper {
+            position: relative;
+            width: 100%;
+        }
+        .channel-tabs-arrow {
+            position: absolute;
+            top: 0; bottom: 0;
+            width: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            z-index: 20;
+            background: linear-gradient(to right, var(--tab-arrow-bg, #f1f5f9), transparent);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s;
+        }
+        .channel-tabs-arrow.left  { left: 0; background: linear-gradient(to right, var(--tab-arrow-bg, #f1f5f9), transparent); }
+        .channel-tabs-arrow.right { right: 0; background: linear-gradient(to left,  var(--tab-arrow-bg, #f1f5f9), transparent); }
+        .channel-tabs-arrow.visible { opacity: 1; pointer-events: all; }
+        .mesh-dark .channel-tabs-arrow { --tab-arrow-bg: #0f172a; }
+        .channel-tabs-row .q-btn__wrapper {
+            min-width: 0 !important;
+            padding: 4px 8px !important;
+        }
+        .channel-tabs-row .q-badge--floating {
+            position: absolute;
+            top: 3px;
+            cursor: inherit;
+        }
+        </style>
+    ''')
     ui.add_head_html('''
         <script>
         (function () {
@@ -2756,6 +3677,29 @@ def main_page():
             return false;
         };
 
+        window.meshPresetCellRenderer = (params) => {
+            const val = params && params.value ? String(params.value) : '';
+            if (!val) return '';
+            const colors = {
+                'LONG_FAST':'#22c55e','MEDIUM_FAST':'#3b82f6','LONG_SLOW':'#a855f7',
+                'MEDIUM_SLOW':'#f59e0b','SHORT_FAST':'#ef4444','SHORT_SLOW':'#f97316',
+                'SHORT_TURBO':'#ec4899','LONG_TURBO':'#06b6d4','LONG_MODERATE':'#84cc16',
+                'VERY_LONG_SLOW':'#64748b'
+            };
+            const shortNames = {
+                'LONG_FAST':'LongFast','MEDIUM_FAST':'MedFast','LONG_SLOW':'LongSlow',
+                'MEDIUM_SLOW':'MedSlow','SHORT_FAST':'ShortFast','SHORT_SLOW':'ShortSlow',
+                'SHORT_TURBO':'ShrtTurbo','LONG_TURBO':'LngTurbo','LONG_MODERATE':'LngMod',
+                'VERY_LONG_SLOW':'VLongSlow'
+            };
+            const col = colors[val] || '#64748b';
+            const label = shortNames[val] || val;
+            const span = document.createElement('span');
+            span.style.cssText = `background:${col};color:white;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:700;`;
+            span.textContent = label;
+            return span;
+        };
+
         window.meshCopyCellRenderer = (params) => {
             const value = params && params.value !== undefined && params.value !== null ? String(params.value) : '';
             const isClickable = !!(params && params.data && params.data.lat && params.data.lon);
@@ -2882,11 +3826,15 @@ def main_page():
                 legend.onAdd = function () {
                     const div = window.L.DomUtil.create('div', 'mesh-node-legend');
                     const title = (window.meshT ? window.meshT('map.legend.lastheard', 'Last Heard') : 'Last Heard');
-                    div.innerHTML =
+                   div.innerHTML =
                         '<div class="mesh-node-legend-title">' + window.meshEscapeHtml(title) + '</div>' +
                         '<div class="mesh-node-legend-row"><span class="mesh-node-legend-swatch mesh-node-green"></span><span>≤ 3h</span></div>' +
                         '<div class="mesh-node-legend-row"><span class="mesh-node-legend-swatch mesh-node-yellow"></span><span>≤ 6h</span></div>' +
-                        '<div class="mesh-node-legend-row"><span class="mesh-node-legend-swatch mesh-node-orange"></span><span>&gt; 6h</span></div>';
+                        '<div class="mesh-node-legend-row"><span class="mesh-node-legend-swatch mesh-node-orange"></span><span>&gt; 6h</span></div>' +
+                        '<div style="border-top:1px solid rgba(0,0,0,0.10);margin:6px 0 4px;"></div>' +
+                        '<div class="mesh-node-legend-row"><span class="mesh-node-legend-swatch" style="border:3px solid #00f5ff;box-shadow:0 0 0 2px rgba(0,245,255,0.30),0 0 8px 2px rgba(0,245,255,0.22);"></span><span>Direct (0 hops)</span></div>' +
+                        '<div class="mesh-node-legend-row"><span class="mesh-node-legend-swatch" style="border:1px solid rgba(116,116,116,0.92);"></span><span>Indirect (relayed)</span></div>' +
+                        '<div class="mesh-node-legend-row"><span class="mesh-node-legend-swatch" style="border:1.5px dashed rgba(200,200,200,0.72);"></span><span>Hops unknown</span></div>';
                     return div;
                 };
                 legend.addTo(map);
@@ -2894,10 +3842,11 @@ def main_page():
             } catch (e) { }
         };
 
-        window.meshMarkerHtml = (label, cls) => {
+        window.meshMarkerHtml = (label, cls, hopCls) => {
             const text = window.meshEscapeHtml(label ?? '');
             const c = window.meshEscapeHtml(cls ?? '');
-            return '<div class="mesh-node-marker ' + c + '"><div class="mesh-node-text">' + text + '</div></div>';
+            const h = window.meshEscapeHtml(hopCls ?? 'mesh-node-unknown');
+            return '<div class="mesh-node-marker ' + c + ' ' + h + '"><div class="mesh-node-text">' + text + '</div></div>';
         };
 
         window.meshGetNodeMarkerDims = (map) => {
@@ -2999,9 +3948,74 @@ def main_page():
                         if (!node) continue;
                         node.classList.remove('mesh-node-green', 'mesh-node-yellow', 'mesh-node-orange');
                         node.classList.add(cls);
+                        const lastHops = marker._mesh_hops;
+                        node.classList.remove('mesh-node-direct', 'mesh-node-indirect', 'mesh-node-unknown');
+                        const hopCls2 = (lastHops === 0) ? 'mesh-node-direct' : (lastHops === null || lastHops === undefined) ? 'mesh-node-unknown' : 'mesh-node-indirect';
+                        node.classList.add(hopCls2);
                     }
                 }
             } catch (e) { }
+        };
+
+        window.meshShowOverlapPopup = (map, lat, lon, overlapping, store) => {
+            try {
+                if (!window.L || !map) return;
+                if (window._meshOverlapPopup) {
+                    window._meshOverlapPopup.remove();
+                    window._meshOverlapPopup = null;
+                }
+                window._meshOverlapMap = map;
+                window._meshOverlapStore = store;
+
+                const container = document.createElement('div');
+                container.style.minWidth = '160px';
+                container.style.maxWidth = '260px';
+
+                const title = document.createElement('div');
+                title.style.cssText = 'font-weight:700;margin-bottom:6px;font-size:13px;';
+                title.textContent = '📍 ' + overlapping.length + ' ' + (window.meshT ? window.meshT('map.overlap.nodes_here', 'nodes here') : 'nodes here');
+                container.appendChild(title);
+
+                overlapping.forEach(function(item) {
+                    const row = document.createElement('div');
+                    row.style.cssText = 'padding:5px 0;border-top:1px solid rgba(0,0,0,0.10);cursor:pointer;';
+
+                    const nameSpan = document.createElement('span');
+                    nameSpan.style.fontWeight = '600';
+                    nameSpan.textContent = item.label;
+
+                    const idSpan = document.createElement('span');
+                    idSpan.style.cssText = 'font-size:11px;color:#64748b;margin-left:6px;';
+                    idSpan.textContent = item.id;
+
+                    row.appendChild(nameSpan);
+                    row.appendChild(idSpan);
+
+                    row.addEventListener('click', function() {
+                        try {
+                            if (window._meshOverlapPopup) {
+                                window._meshOverlapPopup.remove();
+                                window._meshOverlapPopup = null;
+                            }
+                            const m = window._meshOverlapStore && window._meshOverlapStore[item.id];
+                            if (m && m._mesh_popup_html) {
+                                const latlng = m.getLatLng();
+                                window.L.popup({ closeButton: true, autoClose: true })
+                                    .setLatLng(latlng)
+                                    .setContent(m._mesh_popup_html)
+                                    .openOn(window._meshOverlapMap);
+                            }
+                        } catch(e) {}
+                    });
+
+                    container.appendChild(row);
+                });
+
+                window._meshOverlapPopup = window.L.popup({ closeButton: true, autoClose: true })
+                    .setLatLng([lat, lon])
+                    .setContent(container)
+                    .openOn(map);
+            } catch(e) {}
         };
 
         window.meshUpsertNodesOnMap = (mapElementId, nodes) => {
@@ -3022,8 +4036,17 @@ def main_page():
 
                 if (!map._meshNodeColorTimer) {
                     map._meshNodeColorTimer = window.setInterval(() => {
-                        window.meshRefreshNodeMarkerColors(map);
+                        try { window.meshRefreshNodeMarkerColors(map); } catch(e) {}
                     }, 30000);
+                    //Register cleanup if the map is removed
+                    map.on('remove', function() {
+                        try {
+                            if (map._meshNodeColorTimer) {
+                                window.clearInterval(map._meshNodeColorTimer);
+                                map._meshNodeColorTimer = null;
+                            }
+                        } catch(e) {}
+                    });
                 }
 
                 const list = Array.isArray(nodes) ? nodes : [];
@@ -3040,7 +4063,9 @@ def main_page():
                     const label = String(n.marker_label ?? '');
                     const popup = String(n.popup ?? '');
 
-                    const html = window.meshMarkerHtml(label, cls);
+                    const hops = n.hops;
+                    const hopCls = (hops === 0) ? 'mesh-node-direct' : (hops === null || hops === undefined) ? 'mesh-node-unknown' : 'mesh-node-indirect';
+                    const html = window.meshMarkerHtml(label, cls, hopCls);
                     const icon = window.L.divIcon({
                         className: 'mesh-node-divicon',
                         html: html,
@@ -3051,28 +4076,90 @@ def main_page():
 
                     if (!store[nid]) {
                         const marker = window.L.marker([lat, lon], { icon: icon, interactive: true });
-                        if (popup) marker.bindPopup(popup);
                         marker._mesh_last_seen_ts = lastSeenTs;
+                        marker._mesh_hops = (hops === null || hops === undefined) ? null : Number(hops);
                         marker._mesh_icon_html = html;
+                        marker._mesh_node_label = label;
+                        marker._mesh_popup_html = popup;
+                        marker._map = map;
                         marker.addTo(map);
                         store[nid] = marker;
+                        marker.on('click', function(e) {
+                            try {
+                                const thisLat = marker.getLatLng().lat;
+                                const thisLon = marker.getLatLng().lng;
+                                const p0 = marker.getLatLng();
+                                const THRESH_M = 9;
+                                const overlapping = [];
+                                for (const oid in store) {
+                                    const om = store[oid];
+                                    if (!om) continue;
+                                    const ol = om.getLatLng();
+                                    if (p0 && ol && typeof p0.distanceTo === 'function' && p0.distanceTo(ol) <= THRESH_M) {
+                                        overlapping.push({ id: oid, label: om._mesh_node_label || oid });
+                                    }
+                                }
+                                if (overlapping.length > 1) {
+                                    window.L.DomEvent.stopPropagation(e);
+                                    window.meshShowOverlapPopup(map, thisLat, thisLon, overlapping, store);
+                                } else {
+                                    const p = marker._mesh_popup_html;
+                                    if (p) {
+                                        window.L.popup({ closeButton: true, autoClose: true })
+                                            .setLatLng(marker.getLatLng())
+                                            .setContent(p)
+                                            .openOn(map);
+                                    }
+                                }
+                            } catch(ex) {}
+                        });
                         continue;
                     }
 
                     const marker = store[nid];
                     try { marker.setLatLng([lat, lon]); } catch (e) { }
-                    if (popup) {
-                        try { marker.bindPopup(popup); } catch (e) { }
-                    }
                     if (marker._mesh_icon_html !== html) {
                         try { marker.setIcon(icon); } catch (e) { }
                         marker._mesh_icon_html = html;
+                        try { marker.off('click'); } catch(e) {}
+                        marker.on('click', function(e) {
+                            try {
+                                const thisLat = marker.getLatLng().lat;
+                                const thisLon = marker.getLatLng().lng;
+                                const p0 = marker.getLatLng();
+                                const THRESH_M = 9;
+                                const overlapping = [];
+                                for (const oid in store) {
+                                    const om = store[oid];
+                                    if (!om) continue;
+                                    const ol = om.getLatLng();
+                                    if (p0 && ol && typeof p0.distanceTo === 'function' && p0.distanceTo(ol) <= THRESH_M) {
+                                        overlapping.push({ id: oid, label: om._mesh_node_label || oid });
+                                    }
+                                }
+                                if (overlapping.length > 1) {
+                                    window.L.DomEvent.stopPropagation(e);
+                                    window.meshShowOverlapPopup(map, thisLat, thisLon, overlapping, store);
+                                } else {
+                                    const p = marker._mesh_popup_html;
+                                    if (p) {
+                                        window.L.popup({ closeButton: true, autoClose: true })
+                                            .setLatLng(marker.getLatLng())
+                                            .setContent(p)
+                                            .openOn(map);
+                                    }
+                                }
+                            } catch(ex) {}
+                        });
                     }
                     const prevTs = Number(marker._mesh_last_seen_ts || 0);
                     if (lastSeenTs > 0 && prevTs > 0 && lastSeenTs > prevTs + 0.5) {
                         window.meshPulseMarker(marker, 9000, 1000);
                     }
                     marker._mesh_last_seen_ts = lastSeenTs;
+                    marker._mesh_hops = (hops === null || hops === undefined) ? null : Number(hops);
+                    marker._mesh_popup_html = popup;
+                    marker._mesh_node_label = label;
                 }
             } catch (e) { }
         };
@@ -3083,8 +4170,14 @@ def main_page():
                 const map = el && el.map;
                 if (!map || !map._meshNodeMarkers) return;
                 const marker = map._meshNodeMarkers[String(nodeId ?? '')];
-                if (!marker) return;
-                try { marker.openPopup(); } catch (e) { }
+                if (!marker || !marker._mesh_popup_html) return;
+                // Open popup manually (markers use L.popup directly, not bindPopup)
+                try {
+                    window.L.popup({ closeButton: true, autoClose: true })
+                        .setLatLng(marker.getLatLng())
+                        .setContent(marker._mesh_popup_html)
+                        .openOn(map);
+                } catch (e) { }
             } catch (e) { }
         };
         </script>
@@ -3123,6 +4216,14 @@ def main_page():
             }
             .language-select .q-field__native {
                 text-align: center;
+            }
+            .q-dialog .q-scrollarea__content {
+                max-width: 100%;
+                overflow-x: hidden;
+            }
+
+            .q-dialog .q-scrollarea__container {
+                overflow-x: hidden;
             }
             .mesh-label-text, .mesh-city-text {
                 background: transparent !important;
@@ -3177,6 +4278,9 @@ def main_page():
             .mesh-node-yellow { background: #FBBF24; color: rgba(17,24,39,0.95); border-color: rgba(255,255,255,0.92); }
             .mesh-node-yellow .mesh-node-text { text-shadow: none; }
             .mesh-node-orange { background: #FB923C; }
+            .mesh-node-direct   { border: 3px solid #00f5ff !important; box-shadow: 0 0 0 2px rgba(0,245,255,0.30), 0 0 10px 2px rgba(0,245,255,0.22), 0 8px 18px rgba(0,0,0,0.28); }
+            .mesh-node-indirect { border: 1px solid rgba(116,116,116,0.92) !important; }
+            .mesh-node-unknown  { border: 1.5px dashed rgba(200,200,200,0.72) !important; }
 
             .mesh-node-marker.mesh-pulse::after {
                 content: '';
@@ -3620,6 +4724,7 @@ def main_page():
         "notification.error.copytext": translate("notification.error.copytext", "Copy text failed"),
         "map.legend.lastheard": translate("map.legend.lastheard", "Last Heard"),
         "button.toggletheme": translate("button.toggletheme", "Toggle Theme"),
+        "map.overlap.nodes_here": translate("map.overlap.nodes_here", "nodes here"),
     }
     ui.run_javascript(f'window.mesh_i18n = {json.dumps(js_i18n)};')
 
@@ -3788,18 +4893,180 @@ def main_page():
                         with ui.tab_panel(tab_direct):
                             ui.label(translate("panel.connection.settings.internal.title", "Internal SDR Engine")).classes('font-bold mb-0')
                             ui.markdown(translate("panel.connection.settings.internal.help", 'The app manages the internal SDR engine for you.<br> Just select Region, Channel, PPM for your device and a suitable RF Gain.')).classes('text-sm text-gray-600')
+                            _saved_device_args = str(getattr(state, "direct_device_args", "rtl=0") or "").strip()
+                            _direct_device_options = {
+                                "": translate("panel.connection.settings.internal.device.auto", "Auto (first detected)"),
+                            }
+                            if _saved_device_args and _saved_device_args not in _direct_device_options:
+                                m_driver = re.match(r"^([a-zA-Z_]+)=(\d+)", _saved_device_args)
+                                if m_driver:
+                                    drv = m_driver.group(1).upper()
+                                    idx = m_driver.group(2)
+                                    _direct_device_options[_saved_device_args] = f"{drv} #{idx}"
+                                else:
+                                    _direct_device_options[_saved_device_args] = _saved_device_args
+                            with ui.row().classes('w-full items-end gap-2 no-wrap device-row'):
+                                def _update_device_tooltip():
+                                    try:
+                                        v = direct_device_select.value
+                                        full = (direct_device_select.options or {}).get(v)
+                                        direct_device_tooltip.text = str(full or v or "")
+                                    except Exception:
+                                        pass
+
+                                def on_direct_device_change(e):
+                                    state.direct_device_args = e.value
+                                    save_user_config()
+                                    _update_device_tooltip()
+
+                                def _refresh_slot_select():
+                                    slot_select.options = _get_slot_options()
+                                    slot_select.update()
+                                def _on_region_change(e):
+                                    update_config_field('direct_region')(e)
+                                    _refresh_slot_select()
+                                def _on_preset_change(e):
+                                    update_config_field('direct_preset')(e)
+                                    _refresh_slot_select()
+
+                                with ui.element('div').style('flex: 1 1 0; min-width: 0; max-width: calc(100% - 90px); overflow: hidden;'):
+                                    direct_device_select = ui.select(
+                                        options=_direct_device_options,
+                                        value=_saved_device_args if _saved_device_args in _direct_device_options else "",
+                                        on_change=on_direct_device_change,
+                                        label=translate("panel.connection.settings.internal.label.device", "SDR Device"),
+                                    ).props('dense').classes('w-full device-select')
+                                    direct_device_tooltip = ui.tooltip("")
+                                    _update_device_tooltip()
+                                refresh_devices_btn = ui.button(
+                                    translate("panel.connection.settings.internal.button.refresh_devices", "Refresh"),
+                                ).props('dense').classes('bg-slate-200 text-slate-900').style('flex-shrink: 0; white-space: nowrap;')
+                            direct_device_status = ui.label("").classes('text-xs text-gray-500 mb-0')
+                            _scan_state = {'running': False, 'cancel': False}
+                            with ui.row().classes('w-full items-center gap-2 mt-0 mb-0'):
+                                bias_tee_checkbox = ui.checkbox(
+                                    translate("panel.connection.settings.internal.label.bias_tee", "Enable Bias-T / Antenna Power"),
+                                    value=getattr(state, 'direct_bias_tee', False),
+                                    on_change=lambda e: setattr(state, 'direct_bias_tee', e.value) or save_user_config()
+                                ).props('dense').classes('text-xs bias-tee-cb')
+                                ui.icon('warning').classes('text-orange-500 text-xs mt-0')
+                                ui.tooltip(
+                                    translate(
+                                        "panel.connection.settings.internal.tooltip.bias_tee",
+                                        "⚠ Enable only if you know what you are doing!\nThis powers the antenna port (Bias-T).\nConnecting unsupported hardware may damage your SDR or antenna."
+                                    )
+                                ).classes('whitespace-pre-line')
+                            region_options = {k: f"{k} — {v['description']}" for k, v in MESHTASTIC_REGIONS.items() if k != "UNSET"}
+                            # Region select
                             ui.select(
-                                ['EU_868', 'EU_433', 'US_915'],
-                                value=state.direct_region,
-                                on_change=update_config_field('direct_region'),
+                                options=region_options,
+                                value=state.direct_region if state.direct_region in region_options else "EU_868",
+                                on_change=_on_region_change,
                                 label=translate("panel.connection.settings.internal.label.region", "Region")
-                            ).props('dense').classes('w-full mb-0')
+                            ).props('dense options-dense').classes('w-full mb-0')
+                            # Preset select
+                            preset_options = {k: f"{k} — {v['description']}" for k, v in MESHTASTIC_MODEM_PRESETS.items()}
+                            preset_options["ALL"] = translate("panel.connection.settings.internal.option.allpresets", "ALL — Scan all presets simultaneously (Intensive)")
                             ui.select(
-                                list(LORA_PRESETS.keys()),
-                                value=state.direct_preset,
-                                on_change=update_config_field('direct_preset'),
-                                label=translate("panel.connection.settings.internal.label.channel", "Channel")
-                            ).props('dense').classes('w-full mb-0')
+                                options=preset_options,
+                                value=state.direct_preset if state.direct_preset in preset_options else "LONG_FAST",
+                                on_change=_on_preset_change,
+                                label=translate("panel.connection.settings.internal.label.modempreset", "Modem Preset")
+                            ).props('dense options-dense').classes('w-full mb-0')
+                            # Helper function to calculate slot options based on current region and preset.
+                            def _get_slot_options():
+                                import math
+                                r = MESHTASTIC_REGIONS.get(state.direct_region)
+                                p = MESHTASTIC_MODEM_PRESETS.get(state.direct_preset)
+                                if not r or not p:
+                                    return {"0": "Auto (hash-based)"}
+                                wide = r.get("wide_lora", False)
+                                bw_mhz = (p["bw_wide"] if wide else p["bw_narrow"]) / 1000.0
+                                spacing = r.get("spacing", 0.0)
+                                slot_w = spacing + bw_mhz
+                                if slot_w <= 0:
+                                    return {"0": "Auto (hash-based)"}
+                                num_slots = int(math.floor((r["freq_end"] - r["freq_start"]) / slot_w))
+                                if num_slots < 1:
+                                    return {"0": "Auto (hash-based) — preset not compatible with this region"}
+                                opts = {"0": f"Auto (hash → slot {(_djb2_hash(state.direct_channel_name or p['channel_name']) % num_slots) + 1})"}
+                                for i in range(1, num_slots + 1):
+                                    ch_num = i - 1
+                                    freq = r["freq_start"] + bw_mhz / 2.0 + ch_num * slot_w
+                                    opts[str(i)] = f"Slot {i} — {freq:.3f} MHz"
+                                return opts
+                            # Frequency Slot (0=auto)
+                            slot_select = ui.select(
+                                options=_get_slot_options(),
+                                value=str(getattr(state, 'direct_frequency_slot', 0)),
+                                on_change=lambda e: setattr(state, 'direct_frequency_slot', int(e.value or 0)) or save_user_config(),
+                                label=translate("panel.connection.settings.internal.slot", "Frequency Slot (0 = auto/hash)")
+                            ).props('dense options-dense').classes('w-full mb-0')
+                            # Info dynamically updated
+                            with ui.column().classes('gap-0 mb-1') as freq_info_container:
+                                freq_info_label = ui.label("").classes('text-xs text-gray-500')
+                                freq_info_warning = ui.label("").classes('text-xs text-orange-500 hidden')
+                            def _update_freq_info():
+                                r = state.direct_region
+                                p = state.direct_preset
+                                slot = getattr(state, 'direct_frequency_slot', 0)
+                                ch = getattr(state, 'direct_channel_name', '') or None
+                                calc = meshtastic_calc_freq(r, p, slot, ch)
+                                if calc.get("all_presets"):
+                                    freq_info_label.text = translate(
+                                        "panel.connection.settings.internal.info.allpresets.scan",
+                                        "→ Scanning all {n} presets across the {band} band"
+                                    ).format(n=len(MESHTASTIC_MODEM_PRESETS), band=r)
+                                    freq_info_label.classes(remove='text-red-500 text-orange-500', add='text-gray-500')
+                                    freq_info_warning.text = translate(
+                                        "panel.connection.settings.internal.info.allpresets.warning",
+                                        "⚠ Decoding all presets simultaneously is resource-intensive and may affect system performance."
+                                    )
+                                    freq_info_warning.classes(remove='hidden')
+                                elif calc.get("valid"):
+                                    freq_info_label.text = (
+                                        f"→ {calc['center_freq_mhz']:.3f} MHz | "
+                                        f"Slot {calc['slot_used']}/{calc['num_slots']} | "
+                                        f"BW {calc['bw_khz']:.0f}kHz SF{calc['sf']} CR4/{calc['cr']} | "
+                                        f"CH: \"{calc['channel_name']}\""
+                                    )
+                                    freq_info_label.classes(remove='text-red-500 text-orange-500', add='text-gray-500')
+                                    freq_info_warning.text = ""
+                                    freq_info_warning.classes(add='hidden')
+                                else:
+                                    freq_info_label.text = f"⚠ {calc.get('error', 'Invalid combination')}"
+                                    freq_info_label.classes(remove='text-gray-500 text-orange-500', add='text-red-500')
+                                    freq_info_warning.text = ""
+                                    freq_info_warning.classes(add='hidden')
+                            # Update info when relevant parameters change
+                            ui.timer(0.5, _update_freq_info)
+                            with ui.expansion(
+                                translate("panel.connection.settings.internal.label.default_channel_settings", "Edit default channel settings")
+                            ).classes('w-full mb-0 text-xs'):
+                                # Alert explaining default channel
+                                ui.label(
+                                    translate(
+                                        "panel.connection.settings.internal.label.default_channel_alert",
+                                        "⚠ This is the default channel. It is recommended to leave these settings as-is. "
+                                        "To monitor additional channels, click '+ Add Channel' above the chat area."
+                                    )
+                                ).classes('text-xs text-orange-500 mb-2')
+                                direct_channel_input = ui.input(
+                                    translate("panel.connection.settings.internal.channelname", "Channel Name (blank = preset default)"),
+                                    value=getattr(state, 'direct_channel_name', ''),
+                                    on_change=update_config_field('direct_channel_name')
+                                ).classes('w-full mb-0')
+                                direct_key_input = ui.input(
+                                    translate("panel.connection.settings.internal.label.aes_key", "AES Public Key (Base64)"),
+                                    value=state.direct_key_b64,
+                                    on_change=update_config_field('direct_key_b64')
+                                ).classes('w-full mb-1')
+                                ui.label(
+                                    translate(
+                                        "panel.connection.settings.internal.label.aes_key.hint",
+                                        "Key size is auto-detected from the Base64 length (16 bytes = 128-bit, 32 bytes = 256-bit). 'AQ==' = Meshtastic default."
+                                    )
+                                ).classes('text-xs text-gray-400 mt-0 mb-1')
                             ui.number(
                                 translate("panel.connection.settings.internal.label.ppm", "PPM correction"),
                                 value=state.direct_ppm,
@@ -3810,42 +5077,167 @@ def main_page():
                                 value=state.direct_gain,
                                 on_change=on_direct_gain_change
                             ).props('dense').classes('w-full mb-0')
-                            ui.input(
-                                translate("panel.connection.settings.internal.label.port", "Port (don't change if everything works)"),
-                                value=state.direct_port,
-                                on_change=update_config_field('direct_port')
-                            ).classes('w-full mb-0')
-                            ui.input(
-                                translate("panel.connection.settings.internal.label.aes_key", "AES Key (Base64)"),
-                                value=state.direct_key_b64,
-                                on_change=update_config_field('direct_key_b64')
-                            ).classes('w-full mb-1')
+                            with ui.row().classes('w-full items-center gap-1 mb-0'):
+                                ui.input(
+                                    translate("panel.connection.settings.internal.label.port", "Port (don't change if everything works)") + " ⓘ",
+                                    value=state.direct_port,
+                                    on_change=update_config_field('direct_port')
+                                ).classes('flex-1')
+                                ui.tooltip(
+                                    translate(
+                                        "panel.connection.settings.internal.label.port.tooltip",
+                                        "Only change this if the internal engine cannot bind the default port, "
+                                        "or if you are running multiple parallel instances of this application "
+                                        "from different folders with different SDR devices."
+                                    )
+                                ).classes('whitespace-pre-line')
                             with ui.row().classes('w-full justify-end gap-2'):
                                 ui.button(translate("button.cancel", "Cancel"), on_click=connection_dialog.close).classes('bg-slate-200 text-slate-900')
-                                ui.button(translate("button.connect", "Connect"), on_click=lambda: ( _do_connect_direct(), connection_dialog.close() )).classes('bg-blue-600 text-white')
+                                def _on_connect_direct_click():
+                                    # If a scan is running and "Auto" is used, cancel it immediately.
+                                    if _scan_state['running']:
+                                        _scan_state['cancel'] = True
+                                    _do_connect_direct()
+                                    connection_dialog.close()
+
+                                connect_direct_btn = ui.button(
+                                    translate("button.connect", "Connect"),
+                                    on_click=_on_connect_direct_click
+                                ).classes('bg-blue-600 text-white')
 
                         with ui.tab_panel(tab_ext):
                             ui.label(translate("panel.connection.settings.external.title", "External GNU Radio / ZMQ stream")).classes('font-bold mb-1')
                             ui.label(translate("panel.connection.settings.external.help1", "Requires an external specific (our custom frame) GNU Radio flowgraph with a ZMQ PUB block.")).classes('text-sm text-gray-600')
                             ui.label(translate("panel.connection.settings.external.help2", "Configure here the IP, port and AES key of that source.")).classes('text-sm text-gray-600 mb-1')
-                            ui.input(
+                            external_ip_input = ui.input(
                                 translate("panel.connection.settings.external.label.ip", "IP Address"),
                                 value=state.external_ip,
                                 on_change=update_config_field('external_ip')
                             ).classes('w-full mb-1')
-                            ui.input(
+                            external_port_input = ui.input(
                                 translate("panel.connection.settings.external.label.port", "Port"),
                                 value=state.external_port,
                                 on_change=update_config_field('external_port')
                             ).classes('w-full mb-1')
-                            ui.input(
+                            external_key_input = ui.input(
                                 translate("panel.connection.settings.external.label.aes_key", "AES Key (Base64)"),
                                 value=state.external_key_b64,
                                 on_change=update_config_field('external_key_b64')
                             ).classes('w-full mb-2')
+                            ui.label(
+                                translate(
+                                    "panel.connection.settings.internal.label.aes_key.hint",
+                                    "Key size is auto-detected from the Base64 length (16 bytes = 128-bit, 32 bytes = 256-bit). 'AQ==' = Meshtastic default."
+                                )
+                            ).classes('text-xs text-gray-400 mt-0 mb-1')
                             with ui.row().classes('w-full justify-end gap-2'):
                                 ui.button(translate("button.cancel", "Cancel"), on_click=connection_dialog.close).classes('bg-slate-200 text-slate-900')
                                 ui.button(translate("button.connect", "Connect"), on_click=lambda: ( _do_connect_external(), connection_dialog.close() )).classes('bg-blue-600 text-white')
+
+    async def _refresh_direct_devices():
+        # If a scan is already running, signal cancellation and wait
+        if _scan_state['running']:
+            _scan_state['cancel'] = True
+            # Wait max 2s for the previous scan to finish
+            for _ in range(20):
+                await asyncio.sleep(0.1)
+                if not _scan_state['running']:
+                    break
+
+        _scan_state['running'] = True
+        _scan_state['cancel'] = False
+
+        # Disable buttons during the scan
+        refresh_devices_btn.disable()
+        connect_direct_btn.disable()
+
+        # Show "scanning" label in the select
+        scanning_label = translate(
+            "panel.connection.settings.internal.device.scanning", "Scanning devices..."
+        )
+        direct_device_select.options = {"": scanning_label}
+        direct_device_select.value = ""
+        direct_device_select.update()
+        direct_device_status.text = scanning_label
+
+        try:
+            devices, err = await asyncio.to_thread(list_internal_sdr_devices)
+
+            # If cancellation was signaled, stop processing
+            if _scan_state['cancel']:
+                return
+
+            if DEBUGGING:
+                log_to_console(f"[SDRSCAN] ui_result n={len(devices)} err={err}")
+            if err == "no_runtime":
+                direct_device_status.text = translate("panel.connection.settings.internal.device.no_runtime", "Internal engine runtime not found.")
+            elif err == "no_engine_dir":
+                direct_device_status.text = translate("panel.connection.settings.internal.device.no_engine_dir", "Engine folder not found.")
+            elif err:
+                direct_device_status.text = translate("panel.connection.settings.internal.device.scan_failed_details", "Device scan failed (see Console Log).")
+            else:
+                if devices:
+                    direct_device_status.text = translate(
+                        "panel.connection.settings.internal.device.found",
+                        "Detected devices: {n}",
+                    ).format(n=len(devices))
+                else:
+                    direct_device_status.text = translate(
+                        "panel.connection.settings.internal.device.none",
+                        "No devices detected.",
+                    )
+
+            options = {
+                "": translate("panel.connection.settings.internal.device.auto", "Auto (first detected)"),
+            }
+            for dev_args, label in devices:
+                options[dev_args] = label
+            state.direct_device_detected_args = list(options.keys())
+            direct_device_select.options = options
+            cur = getattr(state, "direct_device_args", "")
+            if cur not in options:
+                if cur:
+                    m_driver = re.match(r"^([a-zA-Z_]+)=(\d+)", cur)
+                    if m_driver:
+                        drv = m_driver.group(1).upper()
+                        idx = m_driver.group(2)
+                        options[cur] = f"{drv} #{idx} (not detected)"
+                    else:
+                        options[cur] = f"{cur} (not detected)"
+                    direct_device_select.options = options
+                else:
+                    cur = ""
+                    state.direct_device_args = ""
+                    save_user_config()
+            direct_device_select.value = cur
+            direct_device_select.update()
+            _update_device_tooltip()
+        except Exception:
+            direct_device_status.text = translate("panel.connection.settings.internal.device.scan_failed_details", "Device scan failed (see Console Log).")
+        finally:
+            _scan_state['running'] = False
+            refresh_devices_btn.enable()
+            connect_direct_btn.enable()
+
+    refresh_devices_btn.on_click(lambda: asyncio.create_task(_refresh_direct_devices()))
+    connection_dialog.on('show', lambda: asyncio.create_task(_refresh_direct_devices()))
+    def _sync_connection_dialog_fields():
+        """Re-populate dialog fields with current state values on every open."""
+        try:
+            fields = [
+                (direct_key_input,     state.direct_key_b64),
+                (direct_channel_input, state.direct_channel_name),
+                (external_key_input,   state.external_key_b64),
+                (external_ip_input,    state.external_ip),
+                (external_port_input,  state.external_port),
+            ]
+            for field, value in fields:
+                field.value = value
+                field.update()
+        except Exception as e:
+            log_to_console(f"[SYNC DIALOG] Error: {e}")
+
+    connection_dialog.on('show', lambda: _sync_connection_dialog_fields())
 
     def _do_connect_direct():
         state.ip_address = "127.0.0.1"
@@ -3963,6 +5355,15 @@ def main_page():
                 state.messages.extend(unique_imported_msgs)
                 state.new_messages.extend(unique_imported_msgs)
                 state.chat_force_scroll = True
+
+        if "channel_messages" in data:
+            for ch_id, msgs in data["channel_messages"].items():
+                if isinstance(msgs, list):
+                    existing = state.channel_messages.get(ch_id, deque(maxlen=100))
+                    for msg in msgs:
+                        if isinstance(msg, dict):
+                            existing.append(msg)
+                    state.channel_messages[ch_id] = existing
 
         if "mesh_stats" in data:
             try:
@@ -4210,7 +5611,7 @@ def main_page():
         ui.label(f'{PROGRAM_NAME} - {PROGRAM_SHORT_DESC}').classes('text-md font-semibold')
         with ui.row().classes('w-full items-center gap-2'):
             ui.label(translate("about.version", "Version: {version}").format(version=VERSION)).classes('text-sm text-gray-600')
-            about_update_status = ui.html("", sanitize=False).classes('text-sm')
+            about_update_status = ui.element('div').classes('text-sm')
         ui.label(translate("about.author", "Author: {author}").format(author=AUTHOR)).classes('text-sm text-gray-600 mb-1')
         current_year = datetime.now().year
         copyright_year = 2026
@@ -4245,7 +5646,7 @@ def main_page():
     with ui.dialog().props('persistent') as update_dialog, ui.card().classes('w-[560px]'):
         update_popup_title = ui.label(translate("update.popup.title", "Update available")).classes('text-lg font-bold mb-2')
         update_popup_body = ui.label("").classes('text-sm text-gray-700 whitespace-pre-line mb-3')
-        update_popup_link = ui.html("", sanitize=False).classes('mb-3')
+        update_popup_link = ui.element('div').classes('mb-3')
         with ui.row().classes('w-full justify-end'):
             update_popup_ok = ui.button('OK').classes('bg-slate-200 text-slate-900')
 
@@ -4265,10 +5666,12 @@ def main_page():
         if is_update_available:
             label = html.escape(translate("update.status.update", "Update"))
             url = html.escape(release_url or GITHUB_RELEASES_URL, quote=True)
-            about_update_status.content = f'<a class="text-blue-600 underline font-semibold" href="{url}" target="_blank">{label}</a>'
+            about_update_status._props['innerHTML'] = f'<a class="text-blue-600 underline font-semibold" href="{url}" target="_blank">{label}</a>'
+            about_update_status.update()
         else:
             label = html.escape(translate("update.status.updated", "Updated"))
-            about_update_status.content = f'<span class="text-green-600 font-semibold">{label}</span>'
+            about_update_status._props['innerHTML'] = f'<span class="text-green-600 font-semibold">{label}</span>'
+            about_update_status.update()
 
     async def _check_for_updates(show_popup: bool):
         if getattr(state, "update_check_running", False):
@@ -4297,7 +5700,8 @@ def main_page():
                 ).format(current=VERSION, latest=latest_tag)
                 link_label = html.escape(translate("update.popup.open_release", "Open release page"))
                 url = html.escape(release_url, quote=True)
-                update_popup_link.content = f'<a class="text-blue-600 underline" href="{url}" target="_blank">{link_label}</a>'
+                update_popup_link._props['innerHTML'] = f'<a class="text-blue-600 underline" href="{url}" target="_blank">{link_label}</a>'
+                update_popup_link.update()
                 update_dialog.open()
         finally:
             state.update_check_running = False
@@ -4415,6 +5819,7 @@ def main_page():
                             "messages": list(state.messages),
                             "logs": list(state.logs),
                             "mesh_stats": mesh_stats.to_dict(),
+                            "channel_messages": {k: list(v) for k, v in state.channel_messages.items()},
                         }
 
                     def open_support_dialog():
@@ -4572,6 +5977,40 @@ def main_page():
                         ui.run_javascript(
                             f"window.mesh_main_map_id = {json.dumps(m.id)}; window.mesh_tile_internet = {json.dumps(tile_internet)};"
                         )
+                        ui.run_javascript("""
+                        (function() {
+                            var el = getElement(window.mesh_main_map_id);
+                            var map = el && el.map;
+                            if (!map) return;
+                            var savedLat = %s;
+                            var savedLng = %s;
+                            var savedZoom = %s;
+                            if (savedLat !== null && savedLng !== null) {
+                                map.setView([savedLat, savedLng], savedZoom !== null ? savedZoom : map.getZoom());
+                                return;
+                            }
+                            try {
+                                var lang = (navigator.language || navigator.userLanguage || 'en').toLowerCase();
+                                var centers = {
+                                    'it': [41.9, 12.5], 'de': [51.1, 10.4], 'fr': [46.2, 2.2],
+                                    'es': [40.4, -3.7], 'pt': [39.5, -8.0], 'pl': [52.1, 19.4],
+                                    'nl': [52.3, 5.3], 'sv': [62.0, 15.0], 'no': [60.5, 8.5],
+                                    'da': [56.3, 9.5], 'fi': [61.9, 25.7], 'cs': [49.8, 15.5],
+                                    'ro': [45.9, 24.9], 'hu': [47.2, 19.5], 'el': [39.1, 22.4],
+                                    'uk': [49.0, 31.0], 'ru': [61.5, 90.0], 'zh': [35.9, 104.2],
+                                    'ja': [36.2, 138.3], 'ko': [36.5, 127.9], 'ar': [26.8, 30.8],
+                                    'en-us': [39.5, -98.4], 'en-gb': [54.4, -2.1], 'en-au': [-25.3, 133.8],
+                                };
+                                var key = lang.substring(0, 5);
+                                var center = centers[key] || centers[lang.substring(0, 2)] || [20.0, 0.0];
+                                map.setView(center, map.getZoom());
+                            } catch(e) {}
+                        })();
+                        """ % (
+                            json.dumps(state.map_center_lat),
+                            json.dumps(state.map_center_lng),
+                            json.dumps(getattr(state, 'map_zoom', None)),
+                        ))
                         ui.run_javascript("try { if (window.meshApplyThemeToMapWhenReady) { window.meshApplyThemeToMapWhenReady(); } } catch (e) {}")
 
                         if not tile_internet:
@@ -4596,55 +6035,63 @@ def main_page():
                                 if fn and b and z is not None:
                                     fn(b, z)
 
+                            _poll_view_running = {'value': False}
+
                             async def _poll_view():
-                                if not _offline_refresh.get('fn'):
+                                if _poll_view_running['value']:
                                     return
+                                _poll_view_running['value'] = True
                                 try:
-                                    with m:
-                                        payload = await ui.run_javascript("""
-                                            (() => {
-                                                try {
-                                                    const el = getElement(%s);
-                                                    const map = el && el.map;
-                                                    if (!map) return null;
-                                                    if (map._animatingZoom || map._zooming) {
-                                                        return {animating: true};
+                                    if not _offline_refresh.get('fn'):
+                                        return
+                                    try:
+                                        with m:
+                                            payload = await ui.run_javascript("""
+                                                (() => {
+                                                    try {
+                                                        const el = getElement(%s);
+                                                        const map = el && el.map;
+                                                        if (!map) return null;
+                                                        if (map._animatingZoom || map._zooming) {
+                                                            return {animating: true};
+                                                        }
+                                                        const b = map.getBounds();
+                                                        return {
+                                                            animating: false,
+                                                            zoom: map.getZoom(),
+                                                            bounds: {south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast()},
+                                                        };
+                                                    } catch (e) {
+                                                        return null;
                                                     }
-                                                    const b = map.getBounds();
-                                                    return {
-                                                        animating: false,
-                                                        zoom: map.getZoom(),
-                                                        bounds: {south: b.getSouth(), west: b.getWest(), north: b.getNorth(), east: b.getEast()},
-                                                    };
-                                                } catch (e) {
-                                                    return null;
-                                                }
-                                            })()
-                                        """ % json.dumps(m.id), timeout=1.0)
-                                except Exception:
-                                    return
-                                if not isinstance(payload, dict):
-                                    return
-                                if payload.get('animating'):
-                                    return
-                                b = payload.get('bounds') or {}
-                                z = payload.get('zoom')
-                                if not b or z is None:
-                                    return
+                                                })()
+                                            """ % json.dumps(m.id), timeout=1.0)
+                                    except Exception:
+                                        return
+                                    if not isinstance(payload, dict):
+                                        return
+                                    if payload.get('animating'):
+                                        return
+                                    b = payload.get('bounds') or {}
+                                    z = payload.get('zoom')
+                                    if not b or z is None:
+                                        return
 
-                                if _last_view_payload.get('bounds') == b and _last_view_payload.get('zoom') == z:
-                                    return
+                                    if _last_view_payload.get('bounds') == b and _last_view_payload.get('zoom') == z:
+                                        return
 
-                                _last_view_payload['bounds'] = b
-                                _last_view_payload['zoom'] = z
+                                    _last_view_payload['bounds'] = b
+                                    _last_view_payload['zoom'] = z
 
-                                try:
-                                    h = _view_task.get('handle')
-                                    if h and not h.done():
-                                        h.cancel()
-                                except Exception:
-                                    pass
-                                _view_task['handle'] = asyncio.create_task(_debounced_refresh())
+                                    try:
+                                        h = _view_task.get('handle')
+                                        if h and not h.done():
+                                            h.cancel()
+                                    except Exception:
+                                        pass
+                                    _view_task['handle'] = asyncio.create_task(_debounced_refresh())
+                                finally:
+                                    _poll_view_running['value'] = False
 
                             ui.timer(0.25, lambda: background_tasks.create(_poll_view()))
 
@@ -5033,151 +6480,162 @@ def main_page():
                             
                             return ", ".join(parts)
 
-                        def update_map():
-                            if (not state.nodes_updated) and map_markers_ready.get('value'):
+                        _update_map_running = {'value': False}
+                        # Popup cache: avoid recalculation if node has not changed
+                        _node_popup_cache = {}  # nid -> (last_seen_ts, popup_html)
+
+                        async def update_map():
+                            # Guard: Avoid overlaps if js takes > 1s
+                            if _update_map_running['value']:
                                 return
-                            
-                            nodes_payload = []
-                            for nid, n in state.nodes.items():
-                                if n['lat'] and n['lon']:
-                                    try:
-                                        lat = float(n['lat'])
-                                        lon = float(n['lon'])
-                                    except Exception:
-                                        continue
+                            _update_map_running['value'] = True
+                            try:
+                                if (not state.nodes_updated) and map_markers_ready.get('value'):
+                                    return
 
-                                    label_raw = n.get('short_name')
-                                    if not isinstance(label_raw, str):
-                                        label_raw = ""
-                                    label_raw = label_raw.strip()
-                                    if not label_raw or label_raw == "???":
-                                        label = str(nid)[-4:]
-                                    else:
-                                        label = label_raw[:4]
-                                    
-                                    # Construct popup content
-                                    # Header with clickable name/ID
-                                    name_display = n['long_name']
-                                    short_display = n['short_name'] if n['short_name'] != "???" else ""
-                                    
-                                    popup_content = f"<div style='cursor:pointer' onclick='window.goToNode(\"{nid}\")'>"
-                                    popup_content += f"<b style='font-size:16px; margin-bottom: 8px; display: block;'>{name_display}</b>"
-                                    
-                                    if short_display:
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>label</i> Short Name: {short_display}<br>"
-                                        
-                                    popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>fingerprint</i> ID: {nid}</div>"
-                                    
-                                    popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>memory</i> Model: {n['hw_model']}<br>"
-                                    
-                                    # Environment Metrics
-                                    if n.get('temperature') is not None:
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>thermostat</i> {n['temperature']:.1f}°C<br>"
-                                    if n.get('barometric_pressure') is not None:
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>speed</i> {n['barometric_pressure']:.1f} hPa<br>"
-                                    if n.get('relative_humidity') is not None:
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>water_drop</i> {n['relative_humidity']:.1f}%<br>"
-                                        
-                                    # Device Metrics
-                                    if n.get('battery') is not None:
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>battery_std</i> {n['battery']}%<br>"
-                                    if n.get('channel_utilization') is not None:
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>bar_chart</i> Util: {n['channel_utilization']:.1f}%<br>"
-                                    if n.get('altitude') is not None:
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>terrain</i> Alt: {n['altitude']} m<br>"
-                                    if n.get('uptime_seconds') is not None:
-                                        up_str = format_uptime(n['uptime_seconds'])
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>schedule</i> Up: {up_str}<br>"
-                                    
-                                    hop_label = n.get('hop_label')
-                                    if hop_label is not None:
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>alt_route</i> Hops: {hop_label}<br>"
-                                    
-                                    snr_val = n.get('snr')
-                                    rssi_val = n.get('rssi')
-                                    snr_indirect = n.get('snr_indirect')
-                                    rssi_indirect = n.get('rssi_indirect')
-                                    hops_val = n.get('hops')
-                                    if hops_val == 0:
-                                        if snr_val is not None:
-                                            try:
-                                                snr_float = float(snr_val)
-                                            except:
-                                                snr_float = None
-                                            if snr_float is not None:
-                                                min_snr = -20.0
-                                                max_snr = 10.0
-                                                if snr_float < min_snr:
-                                                    snr_norm = 0.0
-                                                elif snr_float > max_snr:
-                                                    snr_norm = 1.0
-                                                else:
-                                                    snr_norm = (snr_float - min_snr) / (max_snr - min_snr)
-                                                pos_percent = int(snr_norm * 100)
-                                                if pos_percent < 0:
-                                                    pos_percent = 0
-                                                if pos_percent > 100:
-                                                    pos_percent = 100
-                                                popup_content += (
-                                                    "<div style='margin-top:4px;'>"
-                                                    "<div style='display:flex;align-items:center;gap:4px;'>"
-                                                    "<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>signal_cellular_alt</i>"
-                                                    "<div style='position:relative;width:120px;height:10px;"
-                                                    "background:linear-gradient(to right, #ef4444, #facc15, #22c55e);"
-                                                    "border-radius:999px;'>"
-                                                    f"<div style='position:absolute;left:{pos_percent}%;top:50%;"
-                                                    "transform:translate(-50%, -50%);width:12px;height:12px;"
-                                                    "border-radius:999px;background:#111827;border:2px solid white;'></div>"
-                                                    "</div>"
-                                                    "</div>"
-                                                    f"<div class='mesh-muted' style='font-size:11px;margin-top:2px;'>└ SNR: {snr_float:.1f} dB</div>"
-                                                    "</div>"
-                                                )
-                                        
-                                        if rssi_val is not None:
-                                            try:
-                                                rssi_float = float(rssi_val)
-                                            except:
-                                                rssi_float = None
-                                            if rssi_float is not None:
-                                                popup_content += (
-                                                    f"<div class='mesh-muted' style='font-size:11px;margin-top:2px;'>└ RSSI: {rssi_float:.1f} dB</div>"
-                                                )
-                                    else:
-                                        if snr_indirect is not None:
-                                            try:
-                                                snr_indirect_float = float(snr_indirect)
-                                            except:
-                                                snr_indirect_float = None
-                                            if snr_indirect_float is not None:
-                                                popup_content += (
-                                                    "<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>waves</i> "
-                                                    f"RX SNR (indirect): {snr_indirect_float:.1f} dB<br>"
-                                                )
-                                        
-                                    popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>access_time</i> Last Seen: {n['last_seen']}<br>"
-                                    
-                                    if n.get('location_source'):
-                                        popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>my_location</i> Loc Source: {n['location_source']}<br>"
+                                nodes_payload = []
+                                for nid, n in list(state.nodes.items()):
+                                    if n['lat'] and n['lon']:
+                                        try:
+                                            lat = float(n['lat'])
+                                            lon = float(n['lon'])
+                                        except Exception:
+                                            continue
 
-                                    nodes_payload.append({
-                                        "id": nid,
-                                        "lat": lat,
-                                        "lon": lon,
-                                        "last_seen_ts": n.get("last_seen_ts"),
-                                        "marker_label": label.upper(),
-                                        "popup": popup_content,
-                                    })
+                                        label_raw = n.get('short_name')
+                                        if not isinstance(label_raw, str):
+                                            label_raw = ""
+                                        label_raw = label_raw.strip()
+                                        if not label_raw or label_raw == "???":
+                                            label = str(nid)[-4:]
+                                        else:
+                                            label = label_raw[:4]
 
-                            if nodes_payload:
-                                with m:
-                                    ui.run_javascript(
-                                        "try { window.meshUpsertNodesOnMap(%s, %s); } catch (e) {}"
-                                        % (json.dumps(m.id), json.dumps(nodes_payload, ensure_ascii=False, default=str))
-                                    )
-                                map_markers_ready['value'] = True
-                            
-                            state.nodes_updated = False # Reset flag after update
+                                        # Popup cache: recalculate only if last_seen_ts has changed
+                                        last_seen_ts = n.get("last_seen_ts")
+                                        cached = _node_popup_cache.get(nid)
+                                        if cached and cached[0] == last_seen_ts:
+                                            popup_content = cached[1]
+                                        else:
+                                            # Popup construction
+                                            name_display = n['long_name']
+                                            short_display = n['short_name'] if n['short_name'] != "???" else ""
+
+                                            popup_content = f"<div style='cursor:pointer' onclick='window.goToNode(\"{nid}\")'>"
+                                            popup_content += f"<b style='font-size:16px; margin-bottom: 8px; display: block;'>{name_display}</b>"
+
+                                            if short_display:
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>label</i> Short Name: {short_display}<br>"
+
+                                            popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>fingerprint</i> ID: {nid}</div>"
+                                            popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>memory</i> {translate('ui.model', 'Model')}: {n['hw_model']}<br>"
+                                            popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>admin_panel_settings</i> {translate('ui.role', 'Role')}: {n['role']}<br>"
+
+                                            if n.get('temperature') is not None:
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>thermostat</i> {n['temperature']:.1f}°C<br>"
+                                            if n.get('barometric_pressure') is not None:
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>speed</i> {n['barometric_pressure']:.1f} hPa<br>"
+                                            if n.get('relative_humidity') is not None:
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>water_drop</i> {n['relative_humidity']:.1f}%<br>"
+                                            if n.get('battery') is not None:
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>battery_std</i> {n['battery']}%<br>"
+                                            if n.get('channel_utilization') is not None:
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>bar_chart</i> Util: {n['channel_utilization']:.1f}%<br>"
+                                            if n.get('altitude') is not None:
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>terrain</i> Alt: {n['altitude']} m<br>"
+                                            if n.get('uptime_seconds') is not None:
+                                                up_str = format_uptime(n['uptime_seconds'])
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>schedule</i> Up: {up_str}<br>"
+
+                                            hop_label = n.get('hop_label')
+                                            if hop_label is not None:
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>alt_route</i> Hops: {hop_label}<br>"
+
+                                            snr_val = n.get('snr')
+                                            rssi_val = n.get('rssi')
+                                            snr_indirect = n.get('snr_indirect')
+                                            hops_val = n.get('hops')
+
+                                            if hops_val == 0:
+                                                if snr_val is not None:
+                                                    try:
+                                                        snr_float = float(snr_val)
+                                                        min_snr, max_snr = -20.0, 10.0
+                                                        snr_norm = max(0.0, min(1.0, (snr_float - min_snr) / (max_snr - min_snr)))
+                                                        pos_percent = int(snr_norm * 100)
+                                                        popup_content += (
+                                                            "<div style='margin-top:4px;'>"
+                                                            "<div style='display:flex;align-items:center;gap:4px;'>"
+                                                            "<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>signal_cellular_alt</i>"
+                                                            "<div style='position:relative;width:120px;height:10px;"
+                                                            "background:linear-gradient(to right, #ef4444, #facc15, #22c55e);"
+                                                            "border-radius:999px;'>"
+                                                            f"<div style='position:absolute;left:{pos_percent}%;top:50%;"
+                                                            "transform:translate(-50%, -50%);width:12px;height:12px;"
+                                                            "border-radius:999px;background:#111827;border:2px solid white;'></div>"
+                                                            "</div></div>"
+                                                            f"<div class='mesh-muted' style='font-size:11px;margin-top:2px;'>└ SNR: {snr_float:.1f} dB</div>"
+                                                            "</div>"
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                                if rssi_val is not None:
+                                                    try:
+                                                        rssi_float = float(rssi_val)
+                                                        popup_content += (
+                                                            f"<div class='mesh-muted' style='font-size:11px;margin-top:2px;'>└ RSSI: {rssi_float:.1f} dB</div>"
+                                                        )
+                                                    except Exception:
+                                                        pass
+                                            else:
+                                                if snr_indirect is not None:
+                                                    try:
+                                                        snr_indirect_float = float(snr_indirect)
+                                                        popup_content += (
+                                                            "<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>waves</i> "
+                                                            f"RX SNR (indirect): {snr_indirect_float:.1f} dB<br>"
+                                                        )
+                                                    except Exception:
+                                                        pass
+
+                                            preset_name = n.get('preset')
+                                            if preset_name:
+                                                short = MESHTASTIC_MODEM_PRESETS.get(preset_name, {}).get('channel_name', preset_name)
+                                                col = PRESET_COLORS.get(preset_name, '#64748b')
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>settings_input_antenna</i> Preset: <span style='background:{col};color:white;padding:1px 7px;border-radius:999px;font-size:11px;font-weight:700;'>{short}</span><br>"
+
+                                            popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>access_time</i> Last Seen: {n['last_seen']}<br>"
+
+                                            if n.get('location_source'):
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>my_location</i> Loc Source: {n['location_source']}<br>"
+
+                                            # Save to cache
+                                            _node_popup_cache[nid] = (last_seen_ts, popup_content)
+
+                                        nodes_payload.append({
+                                            "id": nid,
+                                            "lat": lat,
+                                            "lon": lon,
+                                            "last_seen_ts": last_seen_ts,
+                                            "marker_label": label.upper(),
+                                            "popup": popup_content,
+                                            "hops": n.get("hops"),
+                                        })
+
+                                if nodes_payload:
+                                    with m:
+                                        await ui.run_javascript(
+                                            "try { window.meshUpsertNodesOnMap(%s, %s); } catch (e) {}"
+                                            % (json.dumps(m.id), json.dumps(nodes_payload, ensure_ascii=False, default=str))
+                                        )
+                                    map_markers_ready['value'] = True
+
+                                state.nodes_updated = False
+
+                            except Exception as e:
+                                log_to_console(f"[MAP UPDATE ERROR] {e}")
+                            finally:
+                                _update_map_running['value'] = False
 
                     # NODES LIST PANEL
                     with ui.tab_panel(nodes_tab).classes('h-full p-0 flex flex-col'):
@@ -5236,6 +6694,7 @@ def main_page():
                                     'width': 80,
                                     ':comparator': '(valueA, valueB, nodeA, nodeB, isInverted) => { const isNullA = valueA === null || valueA === undefined; const isNullB = valueB === null || valueB === undefined; if (isNullA && isNullB) return 0; if (isNullA && !isNullB) { return isInverted ? -1 : 1; } if (!isNullA && isNullB) { return isInverted ? 1 : -1; } const a = Number(valueA); const b = Number(valueB); if (Number.isNaN(a) && Number.isNaN(b)) return 0; if (Number.isNaN(a) && !Number.isNaN(b)) return isInverted ? -1 : 1; if (!Number.isNaN(a) && Number.isNaN(b)) return isInverted ? 1 : -1; if (a === b) return 0; return a < b ? -1 : 1; }'
                                 },
+                                {'headerName': 'Preset', 'field': 'preset', 'width': 120, 'minWidth': 100, ':cellRenderer': 'window.meshPresetCellRenderer'},
                                 {'headerName': 'SNR (dB)', 'field': 'snr', 'width': 100},
                                 {'headerName': 'RSSI (rel dB)', 'field': 'rssi', 'width': 110},
                                 {'headerName': 'Last Seen', 'field': 'last_seen', 'width': 180, 'minWidth': 180, ':cellRenderer': 'window.meshCopyCellRenderer'},
@@ -5282,8 +6741,9 @@ def main_page():
                                 m.set_center((lat, lon)) # Center map
                                 try:
                                     with m:
+                                        # Delay popup open to allow tab switch and map render to complete
                                         ui.run_javascript(
-                                            "try { window.meshOpenNodePopup(%s, %s); } catch (e) {}"
+                                            "setTimeout(function(){ try { window.meshOpenNodePopup(%s, %s); } catch (e) {} }, 300);"
                                             % (json.dumps(m.id), json.dumps(nid))
                                         )
                                 except Exception:
@@ -5434,7 +6894,7 @@ def main_page():
 
                         ui.label(translate("mesh_overview.quality.note", "Note: 1–3 hours of listening are recommended for a more stable overview.")).classes('text-xs text-gray-500 mb-3')
 
-                        traffic_graph = ui.html("", sanitize=False).classes('w-full mb-3')
+                        traffic_graph = ui.element('div').classes('w-full mb-3')
 
                         with ui.row().classes('w-full gap-3 mb-3 flex-wrap'):
                             with ui.card().classes('p-3 w-full md:w-[calc(50%-0.75rem)]'):
@@ -5542,6 +7002,7 @@ def main_page():
                             ui.button(translate("mesh_overview.button.reset", "Reset Stats"), on_click=_ask_reset_stats).classes('bg-slate-200 text-slate-900')
                             ui.button(translate("mesh_overview.button.export", "Export JSON"), on_click=_export_stats_json).classes('bg-blue-600 text-white')
 
+                        _overview_last_snap = {'hash': None}
                         def _update_mesh_overview():
                             snap = mesh_stats.snapshot()
                             series = mesh_stats.sample_packets_per_minute()
@@ -5551,7 +7012,8 @@ def main_page():
                             kpi_active_5m.text = _fmt_num(snap.get("active_nodes_5m"))
                             kpi_err.text = f"{_fmt_num(snap.get('global_error_rate_pct'), 1)}%"
 
-                            traffic_graph.content = _sparkline_svg(series)
+                            traffic_graph._props['innerHTML'] = _sparkline_svg(series)
+                            traffic_graph.update()
 
                             integrity_crc_ok.text = translate("mesh_overview.integrity.crc_ok", "CRC OK: {v}").format(v=_fmt_num(snap.get("crc_ok")))
                             integrity_crc_fail.text = translate("mesh_overview.integrity.crc_fail", "CRC Fail: {v}").format(v=_fmt_num(snap.get("crc_fail")))
@@ -5635,13 +7097,51 @@ def main_page():
                         ui.timer(1.0, _update_mesh_overview)
         
             with splitter.after:
-                with ui.column().classes('h-full w-full no-wrap'):
+                with ui.column().classes('h-full w-full no-wrap'):                    
                     # Top: Chat
                     with ui.row().classes('w-full items-center justify-between p-2'):
-                        ui.label(translate("ui.chatmessages", "Chat Messages")).classes('font-bold')
+                        ui.label(translate("ui.chatmessages", "Chat Messages")).classes('font-bold mt-1 mb-1')
                         chat_resume_btn = ui.button(translate("button.resumeautoscroll", "Resume Auto-Scroll"), icon='arrow_downward', on_click=lambda: enable_chat_scroll()).props('dense color=blue').classes('hidden')
 
-                    chat_scroll = ui.scroll_area().classes('w-full flex-grow p-2 bg-slate-50 border rounded')
+                    # Channel tabs
+                    with ui.element('div').classes('channel-tabs-wrapper').style('margin-bottom: -16px; z-index: 10;') as _tabs_wrapper:
+                        _arrow_left  = ui.element('div').classes('channel-tabs-arrow left').style('font-size:18px;').on('click', lambda: ui.run_javascript("(function(){var r=document.querySelector('.channel-tabs-row');if(r)r.scrollLeft-=120;})()"))
+                        with _arrow_left:
+                            ui.label('‹')
+                        channel_tabs_row = ui.row().classes('channel-tabs-row w-full items-center gap-0 border border-b flex-nowrap px-1 flex-shrink-0 rounded-t').style('position: relative; z-index: 10;')
+                        _arrow_right = ui.element('div').classes('channel-tabs-arrow right').style('font-size:18px;').on('click', lambda: ui.run_javascript("(function(){var r=document.querySelector('.channel-tabs-row');if(r)r.scrollLeft+=120;})()"))
+                        with _arrow_right:
+                            ui.label('›')
+
+                    ui.run_javascript('''
+                    (function() {
+                        function initTabsScroll() {
+                            var row = document.querySelector('.channel-tabs-row');
+                            var wrapper = document.querySelector('.channel-tabs-wrapper');
+                            if (!row || !wrapper) { setTimeout(initTabsScroll, 300); return; }
+                            var arrowL = wrapper.querySelector('.channel-tabs-arrow.left');
+                            var arrowR = wrapper.querySelector('.channel-tabs-arrow.right');
+                            function update() {
+                                var canL = row.scrollLeft > 4;
+                                var canR = row.scrollLeft + row.clientWidth < row.scrollWidth - 4;
+                                arrowL.classList.toggle('visible', canL);
+                                arrowR.classList.toggle('visible', canR);
+                            }
+                            row.addEventListener('scroll', update, {passive: true});
+                            row.addEventListener('wheel', function(e) {
+                                if (e.deltaY !== 0) { e.preventDefault(); row.scrollLeft += e.deltaY * 0.8; }
+                            }, {passive: false});
+                            new MutationObserver(update).observe(row, {childList: true, subtree: true});
+                            update();
+                        }
+                        initTabsScroll();
+                    })();
+                    ''')
+
+                    channel_tab_refs = {}   # channel_id -> {'btn': ui.button, 'dot': ui.badge}
+                    _ch_drag_state = {'dragging': None}
+                    # Chat container
+                    chat_scroll = ui.scroll_area().classes('w-full flex-grow p-2 bg-slate-50 border border-t-0 rounded-b rounded-t-none')
                     with chat_scroll:
                         chat_container = ui.column().classes('w-full')
                     
@@ -5722,101 +7222,371 @@ def main_page():
                                 }}
                             ''')
                             ui.notify(translate("notification.positive.filterednodesby", "Filtered nodes by: {s_id}").format(s_id=s_id))
+                    # Extra channels functions
+                    def _get_all_channel_ids():
+                        ids = ['default'] + [ch['id'] for ch in state.extra_channels 
+                                            if ch['id'] in [x for x in state.channels_order] or True]
+                        # order ids respecting channels_order
+                        ordered = ['default']
+                        for cid in state.channels_order:
+                            if any(ch['id'] == cid for ch in state.extra_channels):
+                                ordered.append(cid)
+                        # add any remaining channels not in order
+                        for ch in state.extra_channels:
+                            if ch['id'] not in ordered:
+                                ordered.append(ch['id'])
+                        return ordered
+
+                    def _get_channel_label(ch_id):
+                        if ch_id == 'default':
+                            # use default channel name if set
+                            name = getattr(state, 'direct_channel_name', '') or getattr(state, 'external_channel_name', '')
+                            return name if name else 'Default'
+                        for ch in state.extra_channels:
+                            if ch['id'] == ch_id:
+                                return ch.get('label') or ch.get('name', ch_id)
+                        return ch_id
+
+                    def rebuild_channel_tabs():
+                        channel_tabs_row.clear()
+                        channel_tab_refs.clear()
+                        with channel_tabs_row:
+                            for ch_id in _get_all_channel_ids():
+                                _render_channel_tab(ch_id)
+                            # Add "+ Add Channel" button
+                            ui.button('+ ' + translate('channel.add.title', 'Add Channel'), on_click=open_add_channel_dialog).props('flat dense').classes('ml-1 text-blue-500 text-xs whitespace-nowrap')
+
+                    def _render_channel_tab(ch_id):
+                        label = _get_channel_label(ch_id)
+                        is_active = (state.active_channel_id == ch_id)
+                        
+                        with ui.element('div').classes('relative flex items-center'):
+                            # Unread dot
+                            cnt = int(state.channel_unread_count.get(ch_id, 0) or 0)
+                            badge_text = '99+' if cnt > 99 else (str(cnt) if cnt > 0 else '')
+                            dot = ui.badge(badge_text).props('floating color=red top-1').classes(
+                                '' if cnt > 0 else 'hidden'
+                            )
+                            
+                            btn = ui.button(label).props('flat dense no-caps').classes(
+                                'channel-tab-btn px-3 py-1 rounded-none border-b-2 ' +
+                                ('border-blue-500 text-blue-600 font-bold' if is_active else 'border-transparent text-gray-600')
+                            )
+                            btn.on('click', lambda cid=ch_id: switch_channel(cid))
+                            
+                            # Right-click context menu (only for non-default channels)
+                            if ch_id != 'default':
+                                with btn:
+                                    with ui.context_menu():
+                                        ui.menu_item(
+                                            translate('channel.ctx.edit', 'Edit'),
+                                            on_click=lambda cid=ch_id: open_edit_channel_dialog(cid)
+                                        )
+                                        ui.menu_item(
+                                            translate('channel.ctx.move_left', 'Move Left'),
+                                            on_click=lambda cid=ch_id: move_channel(cid, -1)
+                                        )
+                                        ui.menu_item(
+                                            translate('channel.ctx.move_right', 'Move Right'),
+                                            on_click=lambda cid=ch_id: move_channel(cid, 1)
+                                        )
+                                        ui.separator()
+                                        ui.menu_item(
+                                            translate('channel.ctx.delete', 'Delete'),
+                                            on_click=lambda cid=ch_id: confirm_delete_channel(cid)
+                                        ).classes('text-red-500')
+                            
+                            channel_tab_refs[ch_id] = {'dot': dot, 'btn': btn}
+
+                    def switch_channel(ch_id):
+                        state.active_channel_id = ch_id
+                        state.channel_unread[ch_id] = False
+                        state.channel_unread_count[ch_id] = 0
+                        state.chat_force_refresh = True
+                        rebuild_channel_tabs()
+
+                    def move_channel(ch_id, direction):
+                        order = _get_all_channel_ids()
+                        non_default = [x for x in order if x != 'default']
+                        if ch_id not in non_default:
+                            return
+                        idx = non_default.index(ch_id)
+                        new_idx = idx + direction
+                        if 0 <= new_idx < len(non_default):
+                            non_default[idx], non_default[new_idx] = non_default[new_idx], non_default[idx]
+                        state.channels_order = non_default
+                        save_user_config()
+                        rebuild_channel_tabs()
+
+                    def confirm_delete_channel(ch_id):
+                        with ui.dialog() as dlg, ui.card().classes('w-96'):
+                            ui.label(translate('channel.delete.title', 'Delete Channel')).classes('text-lg font-bold mb-2')
+                            ui.label(translate('channel.delete.body', 'Are you sure you want to delete this channel?')).classes('text-sm mb-4')
+                            with ui.row().classes('w-full justify-end gap-2'):
+                                ui.button(translate('button.cancel', 'Cancel'), on_click=dlg.close).classes('bg-slate-200 text-slate-900')
+                                def do_delete():
+                                    state.extra_channels = [ch for ch in state.extra_channels if ch['id'] != ch_id]
+                                    if ch_id in state.channels_order:
+                                        state.channels_order.remove(ch_id)
+                                    state.channel_messages.pop(ch_id, None)
+                                    state.channel_unread.pop(ch_id, None)
+                                    state.channel_unread_count.pop(ch_id, None)
+                                    if state.active_channel_id == ch_id:
+                                        state.active_channel_id = 'default'
+                                        state.chat_force_refresh = True
+                                    save_user_config()
+                                    dlg.close()
+                                    rebuild_channel_tabs()
+                                ui.button(translate('button.yes', 'Yes'), on_click=do_delete).classes('bg-red-600 text-white')
+                        dlg.open()
+                    def open_add_channel_dialog(edit_id=None):
+                        existing = None
+                        if edit_id:
+                            for ch in state.extra_channels:
+                                if ch['id'] == edit_id:
+                                    existing = ch
+                                    break
+                        
+                        with ui.dialog() as dlg, ui.card().classes('w-96'):
+                            title = translate('channel.edit.title', 'Edit Channel') if existing else translate('channel.add.title', 'Add Channel')
+                            ui.label(title).classes('text-lg font-bold mb-2')
+                            
+                            name_input = ui.input(
+                                translate('channel.add.name', 'Channel Name'),
+                                value=existing.get('name', '') if existing else ''
+                            ).classes('w-full mb-1')
+                            ui.label(translate('channel.add.name.hint', 'Used to match incoming packets (djb2 hash of name)')).classes('text-xs text-gray-400 mb-2')
+                            
+                            label_input = ui.input(
+                                translate('channel.add.label', 'Display Label (optional, defaults to name)'),
+                                value=existing.get('label', '') if existing else ''
+                            ).classes('w-full mb-1')
+                            
+                            key_input = ui.input(
+                                translate('channel.add.key', 'AES Key (Base64)'),
+                                value=existing.get('key_b64', 'AQ==') if existing else 'AQ=='
+                            ).classes('w-full mb-1')
+                            ui.label(translate('panel.connection.settings.internal.label.aes_key.hint',
+                                "Key size is auto-detected. 'AQ==' = Meshtastic default.")).classes('text-xs text-gray-400 mb-2')
+                            
+                            def save_channel():
+                                import secrets as _sec
+                                name = name_input.value.strip()
+                                if not name:
+                                    ui.notify(translate('channel.add.error.noname', 'Channel name is required'), color='negative')
+                                    return
+                                lbl = label_input.value.strip() or name
+                                key = key_input.value.strip() or 'AQ=='
+                                
+                                if existing:
+                                    existing['name'] = name
+                                    existing['label'] = lbl
+                                    existing['key_b64'] = key
+                                else:
+                                    new_id = _sec.token_urlsafe(8)
+                                    ch = {'id': new_id, 'name': name, 'label': lbl, 'key_b64': key}
+                                    state.extra_channels.append(ch)
+                                    if new_id not in state.channels_order:
+                                        state.channels_order.append(new_id)
+                                
+                                save_user_config()
+                                dlg.close()
+                                rebuild_channel_tabs()
+                            
+                            with ui.row().classes('w-full justify-end gap-2'):
+                                ui.button(translate('button.cancel', 'Cancel'), on_click=dlg.close).classes('bg-slate-200 text-slate-900')
+                                ui.button(translate('button.save', 'Save'), on_click=save_channel).classes('bg-blue-600 text-white')
+                        
+                        dlg.open()
+
+                    def open_edit_channel_dialog(ch_id):
+                        open_add_channel_dialog(edit_id=ch_id)
+
+                    # Virtual window state (for client)
+                    _chat_window = {
+                        'offset': 0,           # from which index of state.messages is the view
+                        'dom_count': 0,        # how many elements are in the DOM now
+                    }
+
+                    def _render_single_message(msg):
+                        """Render a single message — shared function to avoid duplication."""
+                        sent = msg['is_me']
+                        name = get_sender_display_name(msg)
+                        time_str = msg.get('time', '')
+                        date_str = msg.get('date', '')
+
+                        meta = ""
+                        if time_str and date_str:
+                            meta = f"{time_str} | {date_str}"
+                        elif time_str:
+                            meta = time_str
+                        elif date_str:
+                            meta = date_str
+
+                        text_escaped = html.escape(msg.get('text', ''))
+                        body_html = text_escaped
+                        preset_tag = ""
+                        msg_preset = msg.get('preset')
+                        if msg_preset:
+                            preset_colors = {
+                                'LONG_FAST':'#22c55e','MEDIUM_FAST':'#3b82f6','LONG_SLOW':'#a855f7',
+                                'MEDIUM_SLOW':'#f59e0b','SHORT_FAST':'#ef4444','SHORT_SLOW':'#f97316',
+                                'SHORT_TURBO':'#ec4899','LONG_TURBO':'#06b6d4','LONG_MODERATE':'#84cc16',
+                                'VERY_LONG_SLOW':'#64748b'
+                            }
+                            short_names = {
+                                'LONG_FAST':'LongFast','MEDIUM_FAST':'MedFast','LONG_SLOW':'LongSlow',
+                                'MEDIUM_SLOW':'MedSlow','SHORT_FAST':'ShortFast','SHORT_SLOW':'ShortSlow',
+                                'SHORT_TURBO':'ShrtTurbo','LONG_TURBO':'LngTurbo','LONG_MODERATE':'LngMod',
+                                'VERY_LONG_SLOW':'VLongSlow'
+                            }
+                            col = preset_colors.get(msg_preset, '#64748b')
+                            label = short_names.get(msg_preset, msg_preset)
+                            preset_tag = f" <span style='background:{col};color:white;padding:1px 6px;border-radius:999px;font-size:10px;font-weight:700;'>{label}</span>"
+
+                        if meta:
+                            body_html = f"{body_html}<br><span class='mesh-chat-meta'>{meta}{preset_tag}</span>"
+                        elif preset_tag:
+                            body_html = f"{body_html}<br><span class='mesh-chat-meta'>{preset_tag}</span>"
+
+                        is_dark = state.theme == 'dark'
+                        bg_col   = ('blue-6'  if sent else 'blue-10') if is_dark else ('green-9' if sent else 'green-6')
+                        text_col = 'white' if is_dark else 'gray'
+
+                        cm = ui.chat_message(sent=sent, stamp='')
+                        cm.props(f'bg-color={bg_col} text-color={text_col}')
+                        with cm.add_slot('name'):
+                            ui.label(name).classes('text-xs font-bold text-gray-600 cursor-pointer hover:text-blue-600 hover:underline').on('click', lambda m=msg: chat_name_click(m))
+                        with cm:
+                            el = ui.element('div')
+                            el._props['innerHTML'] = body_html
+                            el.update()
+
+                    # "Load more" banner, created once, dynamically shown/hidden
+                    with chat_container:
+                        load_more_banner = ui.row().classes('w-full justify-center py-2 hidden')
+                        with load_more_banner:
+                            def _load_older_messages():
+                                active_id = state.active_channel_id
+                                if active_id == 'default':
+                                    all_msgs = list(state.messages)
+                                else:
+                                    all_msgs = list(state.channel_messages.get(active_id, deque()))
+
+                                current_offset = _chat_window['offset']
+                                load_count = min(_CHAT_LOAD_STEP, current_offset)
+                                if load_count <= 0:
+                                    return
+
+                                new_offset = current_offset - load_count
+                                _chat_window['offset'] = new_offset
+                                msgs_to_add = all_msgs[new_offset:new_offset + load_count]
+
+                                for i, msg in enumerate(msgs_to_add):
+                                    with chat_container:
+                                        _render_single_message(msg)
+                                    new_el = list(chat_container)[-1]
+                                    new_el.move(chat_container, target_index=1 + i)
+
+                                _chat_window['dom_count'] += load_count
+
+                                if new_offset <= 0:
+                                    load_more_banner.classes(add='hidden')
+
+                            ui.button(
+                                '⬆ ' + translate('chat.load_older', 'Load older messages'),
+                                on_click=_load_older_messages
+                            ).props('flat dense').classes('text-blue-500 text-xs')
+                            ui.label(
+                                translate('chat.stored_in_memory', '(all messages kept in memory)')
+                            ).classes('text-xs text-gray-400 ml-2')
+
+                    def _do_force_refresh(all_msgs):
+                        """Clears the message DOM and reloads the latest _CHAT_DOM_WINDOW, preserving the banner."""
+                        children = list(chat_container)
+                        for child in children:
+                            if child is not load_more_banner:
+                                try:
+                                    child.delete()
+                                except Exception:
+                                    pass
+                        _chat_window['dom_count'] = 0
+
+                        total = len(all_msgs)
+                        start = max(0, total - _CHAT_DOM_WINDOW)
+                        _chat_window['offset'] = start
+
+                        with chat_container:
+                            for msg in all_msgs[start:]:
+                                _render_single_message(msg)
+                                _chat_window['dom_count'] += 1
+
+                        if start > 0:
+                            load_more_banner.classes(remove='hidden')
+                        else:
+                            load_more_banner.classes(add='hidden')
+
+                        state.chat_force_refresh = False
+                        state.new_messages.clear()
+
+                        if chat_scroll_state['auto']:
+                            chat_scroll_state['suppress_until'] = time.time() + 0.5
+                            ui.timer(0.1, lambda: chat_scroll.scroll_to(percent=1.0), once=True)
+
 
                     def update_chat():
-                        # Handle Force Scroll (e.g. after import)
+                        active_id = state.active_channel_id
+
+                        if active_id == 'default':
+                            all_msgs = list(state.messages)
+                            new_msgs_source = state.new_messages[:]
+                            state.new_messages.clear()
+                        else:
+                            all_msgs = list(state.channel_messages.get(active_id, deque()))
+                            new_msgs_source = []  # extra channels: update only via force_refresh
+
                         if state.chat_force_scroll:
                             chat_scroll_state['auto'] = True
                             chat_resume_btn.classes(add='hidden')
                             state.chat_force_scroll = False
 
-                        # Check for forced refresh (e.g. names updated)
+                        # Force refresh: applies to ALL channels (default and extra)
                         if state.chat_force_refresh:
-                            chat_container.clear()
-                            # Re-render ALL messages
-                            for msg in state.messages:
-                                with chat_container:
-                                    sent = msg['is_me']
-                                    name = get_sender_display_name(msg)
-                                    time_str = msg.get('time', '')
-                                    date_str = msg.get('date', '')
-                                    
-                                    meta = ""
-                                    if time_str and date_str:
-                                        meta = f"{time_str} | {date_str}"
-                                    elif time_str:
-                                        meta = time_str
-                                    elif date_str:
-                                        meta = date_str
-                                    
-                                    text_escaped = html.escape(msg.get('text', ''))
-                                    body_html = text_escaped
-                                    if meta:
-                                        body_html = f"{body_html}<br><span class='mesh-chat-meta'>{meta}</span>"
-                                    is_dark = state.theme == 'dark'
-                                    if is_dark:
-                                        bg_col = 'blue-6' if sent else 'blue-10'
-                                        text_col = 'white'
-                                    else:
-                                        bg_col = 'green-9' if sent else 'green-6'
-                                        text_col = 'gray'
-                                    
-                                    cm = ui.chat_message(sent=sent, stamp='')
-                                    cm.props(f'bg-color={bg_col} text-color={text_col}')
-                                    
-                                    with cm.add_slot('name'):
-                                        ui.label(name).classes('text-md font-bold text-gray-600 cursor-pointer hover:text-blue-600 hover:underline').on('click', lambda m=msg: chat_name_click(m))
-                                    
-                                    with cm:
-                                        ui.html(body_html, sanitize=False)
-                                    
-                            state.chat_force_refresh = False
-                            state.new_messages.clear() # We just rendered everything
-                            
-                            if chat_scroll_state['auto']:
-                                chat_scroll_state['suppress_until'] = time.time() + 0.5
-                                ui.timer(0.1, lambda: chat_scroll.scroll_to(percent=1.0), once=True)
+                            _do_force_refresh(all_msgs)
+                            return  # new_msgs_source is ignored: we have already rendered everything
+
+                        # Update channel badges
+                        for cid, refs in channel_tab_refs.items():
+                            dot = refs.get('dot')
+                            if dot:
+                                cnt = int(state.channel_unread_count.get(cid, 0) or 0)
+                                dot.text = ('99+' if cnt > 99 else (str(cnt) if cnt > 0 else ''))
+                                if cnt > 0:
+                                    dot.classes(remove='hidden')
+                                else:
+                                    dot.classes(add='hidden')
+
+                        if not new_msgs_source:
                             return
 
-                        if not state.new_messages: return
-                        
-                        while state.new_messages:
-                            msg = state.new_messages.pop(0)
+                        # Add new messages to the end
+                        while new_msgs_source:
+                            msg = new_msgs_source.pop(0)
                             with chat_container:
-                                sent = msg['is_me']
-                                name = get_sender_display_name(msg)
-                                time_str = msg.get('time', '')
-                                date_str = msg.get('date', '')
-                                
-                                meta = ""
-                                if time_str and date_str:
-                                    meta = f"{time_str} | {date_str}"
-                                elif time_str:
-                                    meta = time_str
-                                elif date_str:
-                                    meta = date_str
-                                
-                                text_escaped = html.escape(msg.get('text', ''))
-                                body_html = text_escaped
-                                if meta:
-                                    body_html = f"{body_html}<br><span class='mesh-chat-meta'>{meta}</span>"
-                                is_dark = state.theme == 'dark'
-                                if is_dark:
-                                    bg_col = 'blue-6' if sent else 'blue-10'
-                                    text_col = 'white'
-                                else:
-                                    bg_col = 'green-9' if sent else 'green-6'
-                                    text_col = 'gray'
-                                
-                                cm = ui.chat_message(sent=sent, stamp='')
-                                cm.props(f'bg-color={bg_col} text-color={text_col}')
-                                
-                                with cm.add_slot('name'):
-                                    ui.label(name).classes('text-xs font-bold text-gray-600 cursor-pointer hover:text-blue-600 hover:underline').on('click', lambda m=msg: chat_name_click(m))
-                                
-                                with cm:
-                                    ui.html(body_html, sanitize=False)
-                        
+                                _render_single_message(msg)
+                            _chat_window['dom_count'] += 1
+
+                        # Remove old messages from the DOM if exceeds the threshold
+                        # Data remains intact in state.messages / state.channel_messages
+                        while _chat_window['dom_count'] > _CHAT_DOM_WINDOW + _CHAT_LOAD_STEP:
+                            children = list(chat_container)
+                            # children[0] = banner, children[1] = oldest message in the DOM
+                            if len(children) > 1:
+                                children[1].delete()
+                                _chat_window['dom_count'] -= 1
+                                _chat_window['offset'] += 1
+                                load_more_banner.classes(remove='hidden')
+
                         if chat_scroll_state['auto']:
                             chat_scroll_state['suppress_until'] = time.time() + 0.5
                             ui.timer(0.1, lambda: chat_scroll.scroll_to(percent=1.0), once=True)
@@ -5826,64 +7596,58 @@ def main_page():
                     with ui.row().classes('w-full items-center justify-between p-2 mb-1'):
                         ui.label(translate("ui.consolelog", "Console Log")).classes('font-bold')
                         
-                        # Scroll to bottom button (hidden by default)
-                        scroll_btn = ui.button(translate("button.resumeautoscroll", "Resume Auto-Scroll"), icon='arrow_downward', on_click=lambda: enable_auto_scroll()).props('dense color=green').classes('hidden')
-                        
-                    log_container = ui.scroll_area().classes('h-1/3 w-full bg-black text-green-500 p-2 font-mono text-xs select-text')
+                        # Back to scroll button
+                        log_scroll_btn = ui.button(
+                            translate("button.resumeautoscroll", "Resume Auto-Scroll"), 
+                            icon='arrow_downward', 
+                            on_click=lambda: ui.run_javascript(f'const sc = document.getElementById("c{log_view.id}")?.querySelector(".q-scrollarea__container"); if(sc) sc.scrollTop = sc.scrollHeight;')
+                        ).props('dense color=green').classes('hidden transition-opacity')
+                
+                    log_view = ui.log(max_lines=500).classes('h-1/3 w-full bg-black text-green-500 p-2 font-mono text-xs overflow-auto')
                     
-                    # Scroll State
-                    scroll_state = {'auto': True, 'suppress_until': 0}
+                    ui.run_javascript(f'''
+                        (function tryAttach(attempts) {{
+                            const root = document.getElementById("c{log_view.id}");
+                            if (!root) {{
+                                if (attempts > 0) setTimeout(() => tryAttach(attempts - 1), 300);
+                                return;
+                            }}
+                            const scrollEl = root.querySelector(".q-scrollarea__container");
+                            const btnRoot = document.getElementById("c{log_scroll_btn.id}");
+                            if (!scrollEl || !btnRoot) {{
+                                if (attempts > 0) setTimeout(() => tryAttach(attempts - 1), 300);
+                                else console.warn("log scroll: elements not found after all attempts");
+                                return;
+                            }}
+                            scrollEl.addEventListener('scroll', function() {{
+                                const diff = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+                                if (diff > 80) {{
+                                    btnRoot.classList.remove('hidden');
+                                }} else {{
+                                    btnRoot.classList.add('hidden');
+                                }}
+                            }}, {{ passive: true }});
+                        }})(15);
+                    ''')
 
-                    def handle_scroll(e):
-                        # Ignore scroll events immediately after programmatic scroll
-                        if time.time() < scroll_state['suppress_until']:
-                            return
+                    def _log_needs_spacer(msg: str) -> bool:
+                        low = msg.lower()
+                        no_spacer_keywords = ["crc valid", "crc invalid"]
+                        return not any(k in low for k in no_spacer_keywords)
 
-                        # Pixel-based logic for robust "stick to bottom"
-                        if 'verticalPosition' in e.args and 'verticalSize' in e.args and 'verticalContainerSize' in e.args:
-                            v_pos = e.args['verticalPosition']
-                            v_size = e.args['verticalSize']
-                            v_container = e.args['verticalContainerSize']
-                            
-                            dist_from_bottom = v_size - v_container - v_pos
-                            
-                            # If user scrolls up > 20px from bottom, disable auto-scroll
-                            if dist_from_bottom > 20:
-                                 scroll_state['auto'] = False
-                                 scroll_btn.classes(remove='hidden')
-                            # If user scrolls back to very bottom, re-enable
-                            elif dist_from_bottom < 5:
-                                 scroll_state['auto'] = True
-                                 scroll_btn.classes(add='hidden')
-                    
-                    log_container.on('scroll', handle_scroll, args=['verticalPosition', 'verticalSize', 'verticalContainerSize'])
-
-                    def enable_auto_scroll():
-                        scroll_state['auto'] = True
-                        scroll_btn.classes(add='hidden')
-                        scroll_state['suppress_until'] = time.time() + 0.5 # Ignore events
-                        log_container.scroll_to(percent=1.0) # Correct method for ui.scroll_area
-
-                    # Initial population of logs (history)
-                    with log_container:
-                        for l in state.logs:
-                            ui.label(l).classes('select-text')
-                        # Scroll to bottom initially
-                        ui.timer(0.1, lambda: enable_auto_scroll(), once=True)
+                    for l in state.logs:
+                        if _log_needs_spacer(l):
+                            log_view.push("\u200b")
+                        log_view.push(l)
 
                     def update_log():
                         if not state.new_logs: return
-
-                        # Batch process logs to avoid UI freezing
-                        while state.new_logs:
-                            l = state.new_logs.pop(0)
-                            with log_container:
-                                ui.label(l).classes('select-text').style('white-space: pre-wrap; font-family: monospace;')
-                            
-                        # ONLY scroll if auto-scroll is enabled
-                        if scroll_state['auto']:
-                            scroll_state['suppress_until'] = time.time() + 0.5 # Ignore events caused by this scroll
-                            log_container.scroll_to(percent=1.0)
+                        batch = state.new_logs[:]
+                        state.new_logs.clear()
+                        for l in batch:
+                            if _log_needs_spacer(l):
+                                log_view.push("\u200b")
+                            log_view.push(l)
 
 
     def _check_autosave_on_start():
@@ -5941,11 +7705,56 @@ def main_page():
 
         dlg.open()
 
-    ui.timer(1.0, update_map)
-    ui.timer(0.2, update_grid)
-    ui.timer(0.5, update_chat)
-    ui.timer(0.1, update_log)
-    ui.timer(1.0, _autosave_tick)
+    ui.run_javascript("""
+    (function() {
+        var el = getElement(window.mesh_main_map_id);
+        var map = el && el.map;
+        if (!map) return;
+        map.on('moveend', function() {
+            try {
+                var c = map.getCenter();
+                fetch('/set_map_center', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({lat: c.lat, lng: c.lng, zoom: map.getZoom()}),
+                    keepalive: true
+                });
+            } catch(e) {}
+        });
+    })();
+    """)
+
+    rebuild_channel_tabs()
+    def _safe_timer(fn):
+        if asyncio.iscoroutinefunction(fn):
+            async def wrapper():
+                try:
+                    await fn()
+                except Exception as e:
+                    log_to_console(f"[TIMER ERROR] {fn.__name__}: {e}")
+        else:
+            def wrapper():
+                try:
+                    fn()
+                except Exception as e:
+                    log_to_console(f"[TIMER ERROR] {fn.__name__}: {e}")
+        wrapper.__name__ = fn.__name__  # preserve log name
+        return wrapper
+
+    ui.timer(1.2, _safe_timer(update_map))
+    ui.timer(0.2, _safe_timer(update_grid))
+    ui.timer(0.5, _safe_timer(update_chat))
+    ui.timer(0.2, _safe_timer(update_log))
+    ui.timer(1.0, _safe_timer(_autosave_tick))
+    ui.timer(0.2, _safe_timer(_rtlsdr_error_ui_tick))
+
+    def manual_gc_cleanup():
+        # Debug function to manually trigger garbage collection
+        import gc
+        print("DEBUG: MANUAL GC CLEANUP", flush=True)
+        gc.collect()
+    if DEBUGGING:
+        ui.timer(30.0, manual_gc_cleanup)
 
     _check_autosave_on_start()
     if not state.connection_dialog_shown:
@@ -5955,14 +7764,12 @@ def main_page():
 def open_chrome_app(url: str):
     chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     if not os.path.exists(chrome_path):
-        try:
-            subprocess.run([
-                'osascript', '-e',
-                'display dialog "Google Chrome not found. Please install Chrome to use this application." buttons {"OK"} default button 1 with icon stop'
-            ])
-        except:
-            pass
-        sys.exit(1)  # Exit app if Chrome not found
+        show_fatal_error(
+            "Google Chrome not found",
+            f"{PROGRAM_NAME} requires Google Chrome to run on macOS (to avoid Apple WebKit nightmare).\n\n"
+            "Please install Chrome from https://www.google.com/chrome and relaunch the application."
+        )
+        sys.exit(1)
 
     return subprocess.Popen([
         chrome_path,
@@ -5989,7 +7796,6 @@ def find_free_port(start_port: int = 8000, max_tries: int = 100) -> int:
 def _detect_window_size():
     base_w, base_h = 1200, 720
     try:
-        import tkinter as tk
         root = tk.Tk()
         root.withdraw()
         sw = root.winfo_screenwidth()
@@ -6004,17 +7810,99 @@ def _detect_window_size():
 if __name__ in {"__main__", "__mp_main__"}:
     # Mandatory for PyInstaller on macOS/Linux to prevent infinite spawn loop
     multiprocessing.freeze_support()
+
+    # Suppress NiceGui logging and others logs in distribution to avoid confusion, keep it only in debug mode.
+    import logging as _logging
+    if not DEBUGGING:
+        _logging.getLogger("nicegui").setLevel(_logging.ERROR)
+        _logging.getLogger("uvicorn").setLevel(_logging.ERROR)
+        _logging.getLogger("uvicorn.access").setLevel(_logging.ERROR)
+        _logging.getLogger("uvicorn.error").setLevel(_logging.ERROR)
+        ncgwmex = False            
+    else:
+        ncgwmex = True
+
+    core.sio.max_http_buffer_size = 128 * 1024 * 1024 # set max websocket buffer size to 128MB to manage offline map and large imports
+
+    # === GLOBAL ERROR HANDLER ===
+    import sys as _sys
+    import threading as _threading
+    import traceback as _tb
+
+    def _fatal(exc_type, exc_value, exc_tb):
+        msg = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+        try:
+            show_fatal_error(f"{PROGRAM_NAME} — Unhandled Exception", msg)
+        except Exception:
+            pass
+
+    _sys.excepthook = lambda t, v, tb: _fatal(t, v, tb)
+
+    def _thread_fatal(args):
+        _fatal(args.exc_type, args.exc_value, args.exc_traceback)
+    _threading.excepthook = _thread_fatal
+    # === ASYNCIO UNHANDLED ERRORS ===
+    def _asyncio_exception_handler(loop, context):
+        msg = context.get("exception", context.get("message", "unknown"))
+        log_to_console(f"[ASYNCIO UNHANDLED] {msg}")
+        import traceback as _tb
+        exc = context.get("exception")
+        if exc:
+            full_msg = "".join(_tb.format_exception(type(exc), exc, exc.__traceback__))
+        else:
+            full_msg = f"Unhandled async error:\n{msg}"
+        print(f"[ASYNCIO UNHANDLED]\n{full_msg}", file=sys.stderr)
+        threading.Thread(
+            target=show_fatal_error,
+            args=(f"{PROGRAM_NAME} — Async Error", full_msg),
+            daemon=True
+        ).start()
+
+    async def _set_asyncio_handler():
+        global MAIN_LOOP
+        loop = asyncio.get_running_loop()
+        MAIN_LOOP = loop
+        loop.set_exception_handler(_asyncio_exception_handler)
+        if DEBUGGING:
+            print("DEBUG: asyncio handler installed", flush=True)
+
+    app.on_startup(_set_asyncio_handler)
+    # === GLOBAL ERROR HANDLER END ===
+
+    if DEBUGGING:
+        import faulthandler
+        faulthandler.enable()
+        print("DEBUG: MAIN STARTED", flush=True)
     
     try:
+        if not check_native_runtime_deps():
+            sys.exit(1)
+        
+        if multiprocessing.current_process().name == 'MainProcess':
+            print(f"{PROGRAM_NAME} started.", flush=True)
+            start_tk_splash()
+            
         ensure_app_icon_file()
         system = platform.system()
 
-        if system == "Linux":
-            if not check_linux_native_deps():
-                sys.exit(1)
-
         if system == "Darwin":
-            port = find_free_port(8000)
+            try:
+                port = find_free_port(8000)
+            except RuntimeError as e:
+                show_fatal_error(
+                    f"{PROGRAM_NAME} — Network Error",
+                    f"Could not find a free network port to start the application:\n\n{e}\n\n"
+                    "Try closing other applications and restarting."
+                )
+                sys.exit(1)
+            
+            try:
+                import certifi
+                import ssl
+                os.environ.setdefault('SSL_CERT_FILE', certifi.where())
+                os.environ.setdefault('REQUESTS_CA_BUNDLE', certifi.where())
+            except ImportError:
+                pass
             
             def on_startup():
                 import time
@@ -6025,6 +7913,14 @@ if __name__ in {"__main__", "__mp_main__"}:
             
             app.on_startup(on_startup)
 
+            def _handle_sigterm(signum, frame):
+                _shutdown_cleanup()
+
+            try:
+                signal.signal(signal.SIGTERM, _handle_sigterm)
+            except Exception:
+                pass
+
             ui.run(
                 title=f'{PROGRAM_NAME} v{VERSION} By {AUTHOR}',
                 favicon=get_resource_path('app_icon.svg'),
@@ -6032,7 +7928,11 @@ if __name__ in {"__main__", "__mp_main__"}:
                 port=port,
                 reload=False,
                 show=False,
+                show_welcome_message=ncgwmex
             )
+
+            if DEBUGGING:
+                print("DEBUG: ui.run() returned", flush=True)
 
         else:
             # Windows / Linux: use native pywebview
@@ -6054,6 +7954,107 @@ if __name__ in {"__main__", "__mp_main__"}:
                 # 2. mute qt video driver logging
                 os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
                 os.environ['MESA_LOG_LEVEL'] = '0'
+                # Check if running without a display (e.g. SSH without X forwarding)
+                has_display = bool(os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
+                if not has_display:
+                    show_fatal_error(
+                        f"{PROGRAM_NAME} - No Display Available",
+                        f"{PROGRAM_NAME} is a desktop application and requires a graphical environment.\n\n"
+                        "It looks like you are running it without a display (e.g. via SSH without X forwarding).\n\n"
+                        f"Please run {PROGRAM_NAME} directly from your desktop environment.\n"
+                        "If you need remote access, use a remote desktop solution (VNC, RDP, X forwarding)."
+                    )
+                    sys.exit(1)
+                # Pre-check: verify OpenGL/EGL actually works at runtime
+                if multiprocessing.current_process().name == 'MainProcess':
+                    def _check_opengl_functional() -> bool:
+                        """
+                        Heuristic check for GPU rendering capabilities on Linux systems.
+                        Attempts to verify hardware access, runtime probes, and library availability.
+                        """
+                        import ctypes.util
+                        env = os.environ.copy()
+
+                        # 1. Hardware-level check: Verify if the Direct Rendering Infrastructure (DRI) exists.
+                        # The presence of /dev/dri usually indicates that the kernel-level graphics drivers are active.
+                        if os.path.exists('/dev/dri'):
+                            if DEBUGGING:
+                                print("DEBUG: /dev/dri found, kernel-level drivers present", flush=True)
+
+                        # 2. Functional Probe: Execute common CLI tools to verify a working OpenGL/EGL context.
+                        # Checking the process return code (0) to confirm successful execution.
+                        for cmd in [["glxinfo", "-B"], ["eglinfo"]]:
+                            try:
+                                # Use a short timeout to prevent blocking the main thread if the driver hangs.
+                                r = subprocess.run(cmd, capture_output=True, timeout=3, env=env)
+                                if r.returncode == 0:
+                                    if DEBUGGING:
+                                        print(f"DEBUG: {cmd[0]} probe successful, hardware acceleration likely available", flush=True)
+                                    return True
+                            except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+                                # Move to the next probe if the tool is missing or fails.
+                                continue
+
+                        # 3. Dynamic Linker Search: Use find_library to locate OpenGL or EGL runtimes.
+                        target_libs = ['GL', 'GLESv2', 'EGL']
+                        for lib_name in target_libs:
+                            try:
+                                lib_path = ctypes.util.find_library(lib_name)
+                                if lib_path:
+                                    # Attempt to load the library to verify compatibility with the current architecture.
+                                    ctypes.CDLL(lib_path)
+                                    if DEBUGGING:
+                                        print(f"DEBUG: Successfully loaded {lib_name} via {lib_path}", flush=True)
+                                    return True
+                            except Exception as e:
+                                if DEBUGGING:
+                                    print(f"DEBUG: {lib_name} found at {lib_path} but failed to load: {e}", flush=True)
+
+                        # 4. Path Fallback: Check standard locations for proprietary drivers (e.g., NVIDIA) 
+                        # and Debian/Fedora common paths where find_library might occasionally fail in isolated environments.
+                        fallback_paths = [
+                            '/usr/lib/x86_64-linux-gnu/libGL.so.1',
+                            '/usr/lib64/libGL.so.1',
+                            '/usr/lib/libGL.so.1',
+                            '/usr/lib/x86_64-linux-gnu/libEGL.so.1',
+                            '/usr/lib64/libEGL.so.1'
+                        ]
+                        for path in fallback_paths:
+                            if os.path.exists(path):
+                                try:
+                                    ctypes.CDLL(path)
+                                    if DEBUGGING:
+                                        print(f"DEBUG: Found and loaded fallback library at {path}", flush=True)
+                                    return True
+                                except Exception:
+                                    continue
+
+                        # No functional GPU rendering path was verified.
+                        return False
+
+                    if not _check_opengl_functional():
+                        show_fatal_error(
+                            f"{PROGRAM_NAME} - Graphics Libraries Not Found",
+                            f"{PROGRAM_NAME} could not find OpenGL or EGL libraries on this system.\n\n"
+                            "The application will attempt to start using software rendering.\n"
+                            "If it fails to open, install the required graphics libraries:\n\n"
+                            "  Fedora/RHEL:   sudo dnf install mesa-libGL mesa-libEGL\n"
+                            "  Ubuntu/Debian: sudo apt install libgl1 libegl1\n"
+                            "  Arch:          sudo pacman -S mesa\n\n"
+                            "The application will now continue in software rendering mode.\n\n"
+                            "If you are in a VM, try enabling 3D acceleration, however it is an issue with GPU access/3D acceleration."
+                        )
+                        os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = (
+                            os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '') +
+                            ' --disable-gpu --disable-gpu-rasterization --disable-gpu-compositing --no-sandbox'
+                        ).strip()
+                        os.environ['QT_OPENGL'] = 'software'
+                        os.environ['LIBGL_ALWAYS_SOFTWARE'] = '1'
+                        os.environ['MESA_GL_VERSION_OVERRIDE'] = '3.3'
+                        os.environ['MESA_GLSL_VERSION_OVERRIDE'] = '330'
+                        os.environ['QT_XCB_GL_INTEGRATION'] = 'none'
+                        os.environ['QSG_RENDER_LOOP'] = 'basic'
+                        os.environ['QT_QUICK_BACKEND'] = 'software'
                 try:
                     app.native.start_args['gui'] = 'qt'
                 except Exception:
@@ -6073,11 +8074,27 @@ if __name__ in {"__main__", "__mp_main__"}:
                 host='127.0.0.1',
                 reload=False, # Important for stability in native mode
                 window_size=(win_w, win_h),
+                show_welcome_message=ncgwmex,
                 storage_secret='meshstation_secret' # Adding a secret often helps with pywebview storage init
             )
     except KeyboardInterrupt:
-        # Suppress KeyboardInterrupt traceback on exit
-        pass
+        if DEBUGGING:
+            print("DEBUG: KeyboardInterrupt in MAIN", flush=True)
+        else:
+            pass # Suppress KeyboardInterrupt traceback on exit
+    except SystemExit:
+        if DEBUGGING:
+            print("DEBUG: SystemExit in MAIN", flush=True)
+        raise  # keep sys.exit() without intercepting it
     except Exception as e:
         # Log other unexpected errors but don't show traceback if it's just a shutdown thing
-        print(f"App closed with error: {e}")
+        if DEBUGGING:
+            import traceback
+            print("DEBUG: UNHANDLED EXCEPTION IN MAIN", flush=True)
+            traceback.print_exc()
+        
+        show_fatal_error(
+            f"{PROGRAM_NAME} — Unexpected Error",
+            f"The application encountered an unexpected error and cannot continue:\n\n{e}"
+        )
+        sys.exit(1)

@@ -1,3 +1,4 @@
+# Built in python 3.10.11, not guaranteed to work perfectly in other versions.
 nicegui==3.6.1
 pyzmq==27.1.0
 cryptography==46.0.3
@@ -9,3 +10,5 @@ cffi==2.0.0
 qtpy ; sys_platform == 'linux'
 PySide6 ; sys_platform == 'linux'
 PySide6-Addons ; sys_platform == 'linux'
+# mac specific
+certifi ; sys_platform == 'darwin'

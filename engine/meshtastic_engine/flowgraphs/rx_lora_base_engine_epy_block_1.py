@@ -23,6 +23,7 @@ class blk(gr.basic_block):
         self.payload_wait_ms = 30     # wait this long for a metrics to arrive
         self.metrics_ttl_ms = 200     # drop metrics if no payload within TTL
         self.max_metrics_q = 200
+        self.preset_id = 0  # set by run_engine via tb.aggregator.preset_id = N
 
     def _u8_from_any(self, msg):
         # PDU: (meta . u8vector)
@@ -76,6 +77,7 @@ class blk(gr.basic_block):
         body.append(flags)
         body.extend(self._encode_i16(snr10))
         body.extend(self._encode_i16(rssi10))
+        body.append(int(getattr(self, 'preset_id', 0)) & 0xFF)
 
         # Frame header: type=0x03 + len
         ln = len(body)

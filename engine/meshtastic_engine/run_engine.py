@@ -28,14 +28,25 @@ def main(argv=None) -> int:
     ap.add_argument("--bb-gain", type=int, default=20, help="Baseband gain")
 
     ap.add_argument("--device-args", default="", help="Osmocom source args (e.g. 'rtl=0')")
+    ap.add_argument("--bias-tee", action="store_true", default=False, help="Enable bias-T / antenna power")
     ap.add_argument("--payload-wait-ms", type=int, default=None, help="Override aggregator payload_wait_ms")
     ap.add_argument("--metrics-ttl-ms", type=int, default=None, help="Override aggregator metrics_ttl_ms")
+    ap.add_argument("--preset-id", type=int, default=0, help="Preset ID byte embedded in each frame (0=unset)")
+    ap.add_argument("--extra-demod-configs", default=None, help="JSON list of extra demod chains, e.g. '[{\"sf\":9,\"bw\":250000,...}]'")
 
     args = ap.parse_args(argv)
 
     q = queue.Queue(maxsize=4000)
     server = TCPFrameServer(args.host, args.port, q)
     server.start()
+
+    extra_demod_configs = None
+    if args.extra_demod_configs:
+        try:
+            import json as _json
+            extra_demod_configs = _json.loads(args.extra_demod_configs)
+        except Exception as e:
+            print(f"[ENGINE] Failed to parse extra-demod-configs: {e}", flush=True)
 
     tb = build_top_block(
         center_freq=args.center_freq,
@@ -47,6 +58,8 @@ def main(argv=None) -> int:
         if_gain=args.if_gain,
         bb_gain=args.bb_gain,
         device_args=args.device_args,
+        bias_tee=args.bias_tee,
+        extra_demod_configs=extra_demod_configs,
     )
 
     # Optional: tweak aggregator timings from CLI
@@ -60,9 +73,18 @@ def main(argv=None) -> int:
             tb.aggregator.metrics_ttl_ms = int(args.metrics_ttl_ms)
         except Exception:
             pass
+    try:
+        tb.aggregator.preset_id = int(args.preset_id)
+    except Exception:
+        pass
 
     sink = PDUSink(q)
     tb.msg_connect(tb.aggregator, "out", sink, "in")
+    for chain in getattr(tb, '_extra_chains', []):
+        try:
+            tb.msg_connect(chain['aggregator'], "out", sink, "in")
+        except Exception as e:
+            print(f"[ENGINE] Failed to connect extra chain: {e}", flush=True)
 
     stop = {"flag": False}
 

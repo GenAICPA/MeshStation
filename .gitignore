@@ -40,6 +40,9 @@ relexec/
 # Ignore all runtime folders under engine/os/*/runtime (they are huge)
 engine/os/*/runtime/
 
+# continue dev
+.continue/
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.

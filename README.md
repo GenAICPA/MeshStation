@@ -3,7 +3,6 @@
   <p align="center"><i>Meshtastic SDR Analyzer & Desktop GUI</i></p>
   <br>
   <p align="center">
-    <a href="https://github.com/IronGiu/MeshStation/releases/latest"><img src="https://img.shields.io/badge/⇩-Download_Now-blue" alt="Download"></a>&nbsp;
     <a href="https://ko-fi.com/IronGiu"><img src="https://img.shields.io/badge/Ko--fi-FF5E5B?logo=ko-fi&logoColor=white&label=Donate" alt="Ko-fi"></a>&nbsp;
     <a href="https://irongiu.com"><img src="https://img.shields.io/badge/%F0%9F%8C%90-Website-blue" alt="Website"></a>&nbsp;
     <a href="https://discord.gg/rwV5q5FPCm"><img src="https://img.shields.io/discord/719925738781802528?style=flat&logo=discord&label=Discord" alt="Discord"></a>&nbsp;
@@ -11,10 +10,22 @@
     <a href="https://www.instagram.com/irongiu_official/"><img src="https://img.shields.io/badge/Instagram-%23E4405F.svg?logo=Instagram&logoColor=white" alt="Instagram"></a>&nbsp;
     <a href="https://twitch.tv/irongiu"><img src="https://img.shields.io/badge/Twitch-%239146FF.svg?logo=Twitch&logoColor=white" alt="Twitch"></a>&nbsp;
   </p>
+  <p align="center">
+    <a href="https://meshstationapi.irongiu.com/download?os=win-64"><img src="https://img.shields.io/badge/DOWNLOAD-Windows_x86__64-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Windows x86_64"></a>&nbsp;
+    <a href="https://meshstationapi.irongiu.com/download?os=linux-64"><img src="https://img.shields.io/badge/DOWNLOAD-Linux_x86__64-FCC624?style=for-the-badge&logo=linux&logoColor=white" alt="Linux x86_64"></a>&nbsp;
+    <a href="https://meshstationapi.irongiu.com/download?os=linux-arm64"><img src="https://img.shields.io/badge/DOWNLOAD-Linux_ARM64-FCC624?style=for-the-badge&logo=linux&logoColor=white" alt="Linux ARM64"></a>&nbsp;
+    <a href="https://meshstationapi.irongiu.com/download?os=macos-arm"><img src="https://img.shields.io/badge/DOWNLOAD-macOS_Apple_Silicon-black?style=for-the-badge&logo=apple&logoColor=white" alt="macOS Apple Silicon"></a>&nbsp;
+    <a href="https://meshstationapi.irongiu.com/download?os=macos-64"><img src="https://img.shields.io/badge/DOWNLOAD-macOS_Intel_x86__64-black?style=for-the-badge&logo=apple&logoColor=white" alt="macOS Intel x86_64"></a>
+  </p>
+  <p align="center">
+    <a href="https://github.com/IronGiu/MeshStation/wiki">WIKI / DOCUMENTATION (EN/IT)</a>
+  </p>
 </p>
 
 <a id="english"></a>
-[🇬🇧 English](#english) / [🇮🇹 Italiano](#italian)
+<p align="center">
+  <a href="#english">🇬🇧 English Readme</a> / <a href="#italian">🇮🇹 Readme Italiano</a>
+</p>
 
 ## 🇬🇧 English
 
@@ -47,6 +58,8 @@ This enables use cases that are currently hard or impossible with standard Mesht
 - Evaluate network density **before buying a compatible Meshtastic device**
 - Analyze signal reach and RF presence over time
 - Monitor network quality and performance
+- **Scan all modem presets at once (LongFast, MediumFast etc.)**
+- **Scan all the MeshTastic frequencies in the world**
 
 #### 🧠 Network Mapping & Research
 - Map the **real Meshtastic network as it actually exists**
@@ -63,8 +76,13 @@ This enables use cases that are currently hard or impossible with standard Mesht
 #### 📢 Public Message Monitoring
 - Read **unencrypted / public Meshtastic messages**
 - Stay informed about **what is happening on the network**
-- Observe real-time community activity and traffic patterns  
-*(private/encrypted messages are not decrypted)*
+- Observe real-time community activity and traffic patterns
+*(private/encrypted messages are not decrypted)* 
+
+### 🔐 Monitoring channels
+- Read even encrypted channels (with the correct key and exact name)
+- Check if the channel is active before adding it (since you have limited channels in the official firmware)
+- Monitor an unlimited number of channels by adding them to the "Chat Messages" section with the dedicated button.
 
 #### 🧪 Experimentation & Testing
 - Test Meshtastic behavior using **only an SDR as receiver**
@@ -93,7 +111,7 @@ If adequate **financial and community support** is reached, MeshStation aims to 
 - Supported SDR drivers
 - A system capable of real-time SDR processing
 
-*(Full setup instructions will be expanded as the project matures)*
+**Visit the wiki if you're having trouble with drivers or to learn how to "install" the app:** [https://github.com/IronGiu/MeshStation/wiki](https://github.com/IronGiu/MeshStation/wiki)
 
 ---
 
@@ -113,8 +131,9 @@ If you find this project useful or exciting:
 
 ---
 
-<a id="italian"></a>
-[🇬🇧 English](#english) / [🇮🇹 Italiano](#italian)
+<p align="center">
+  <a href="#english">🇬🇧 English Readme</a> / <a href="#italian">🇮🇹 Readme Italiano</a>
+</p>
 
 ## 🇮🇹 Italiano
 
@@ -147,6 +166,8 @@ Questo permette casi d’uso difficili o impossibili con le configurazioni Mesht
 - Valutare la presenza della rete **prima di acquistare un device compatibile**
 - Analizzare la copertura RF nel tempo
 - Monitorare la qualità e le performance della rete
+- **Scansionare contemporaneamente tutti i modem-preset (LongFast, MediumFast ecc)**
+- **Scansionare tutte le frequenze MeshTastic del mondo**
 
 #### 🧠 Mappatura & Studio della Rete
 - Mappare la **rete Meshtastic reale**, così com’è davvero
@@ -164,7 +185,11 @@ Questo permette casi d’uso difficili o impossibili con le configurazioni Mesht
 - Leggere **messaggi Meshtastic pubblici/non cifrati**
 - Rimanere informati su **ciò che accade nella rete**
 - Osservare attività e traffico in tempo reale  
-*(i messaggi privati/cifrati non vengono decodificati)*
+
+### 🔐 Monitoraggio canali
+- Leggi i canali anche criptati (con la giusta chiave e il nome esatto)
+- Guarda se il canale è attivo prima di aggiungerlo (visto che hai canali limitati nel firmware ufficiale)
+- Monitora una quantità di canali illimitati aggiungendoli nella sezione "Messaggi Chat" con l'apposito tasto.
 
 #### 🧪 Test & Sperimentazione
 - Testare Meshtastic usando **solo un SDR come ricevitore**
@@ -193,7 +218,7 @@ Con un adeguato **supporto economico e della community**, MeshStation potrà evo
 - Driver SDR supportati
 - Sistema in grado di gestire SDR in tempo reale
 
-*(Le istruzioni complete verranno ampliate con la crescita del progetto)*
+**Vai nella wiki se hai problemi con driver o per sapere come "installare" l'app:** [https://github.com/IronGiu/MeshStation/wiki](https://github.com/IronGiu/MeshStation/wiki)
 
 ---
 
