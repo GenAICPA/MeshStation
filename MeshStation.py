@@ -237,8 +237,8 @@ def _fetch_latest_github_release(timeout_sec: float = 10.0) -> dict | None:
 # --- MeshCore Constants ---
 MESHCORE_PRESETS = {
     "USA_CANADA": {
-        "RECOMMENDED": {"freq": 910.525, "sf": 7,  "bw": 62.5, "cr": 5, "sync": 0x12, "preamble": 16, "description": "USA/Canada (Recommended)"},
-        "LEGACY_WIDE": {"freq": 915.8,   "sf": 10, "bw": 250.0, "cr": 5, "sync": 0x12, "preamble": 16, "description": "Legacy 915-region Wide"},
+        "RECOMMENDED": {"freq": 910.525, "sf": 7,  "bw": 62.5, "cr": 5, "sync": 0x12, "preamble": 16, "description_key": "meshcore.preset.recommended"},
+        "LEGACY_WIDE": {"freq": 915.8,   "sf": 10, "bw": 250.0, "cr": 5, "sync": 0x12, "preamble": 16, "description_key": "meshcore.preset.legacy_wide"},
     },
 }
 
@@ -1801,6 +1801,24 @@ def load_user_config():
     if isinstance(v, list):
         s.channels_order = [x for x in v if isinstance(x, str)]
 
+    v = data.get("network_mode")
+    if v in ("meshtastic", "meshcore"):
+        s.network_mode = v
+    v = data.get("meshcore_region")
+    if isinstance(v, str):
+        s.meshcore_region = v
+    v = data.get("meshcore_preset")
+    if isinstance(v, str):
+        s.meshcore_preset = v
+    for field in ["meshcore_custom_freq", "meshcore_custom_sf", "meshcore_custom_bw",
+                  "meshcore_custom_cr", "meshcore_custom_sync_word", "meshcore_custom_preamble_len"]:
+        v = data.get(field)
+        if v is not None:
+            try:
+                setattr(s, field, type(getattr(s, field))(v))
+            except Exception:
+                pass
+
 def save_user_config():
     try:
         path = get_config_path()
@@ -1827,6 +1845,15 @@ def save_user_config():
             "map_zoom": getattr(state, "map_zoom", None),
             "extra_channels": getattr(state, 'extra_channels', []),
             "channels_order": getattr(state, 'channels_order', []),
+            "network_mode": state.network_mode,
+            "meshcore_region": state.meshcore_region,
+            "meshcore_preset": state.meshcore_preset,
+            "meshcore_custom_freq": state.meshcore_custom_freq,
+            "meshcore_custom_sf": state.meshcore_custom_sf,
+            "meshcore_custom_bw": state.meshcore_custom_bw,
+            "meshcore_custom_cr": state.meshcore_custom_cr,
+            "meshcore_custom_sync_word": state.meshcore_custom_sync_word,
+            "meshcore_custom_preamble_len": state.meshcore_custom_preamble_len,
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -2245,7 +2272,8 @@ def decodeMeshCore(packet_bytes, snr=None, rssi=None):
         name = "Unknown"
         lat = None
         lon = None
-        role = "Companion"
+        role_label = translate("meshcore.role.companion", "Companion")
+        role_internal = "Companion"
         relay_capable = False
 
         if len(appdata) > 0:
@@ -2263,13 +2291,16 @@ def decodeMeshCore(packet_bytes, snr=None, rssi=None):
 
             type_bits = flags & 0x07
             if type_bits == 0x02:
-                role = "Repeater"
+                role_label = translate("meshcore.role.repeater", "Repeater")
+                role_internal = "Repeater"
                 relay_capable = True
             elif type_bits == 0x03:
-                role = "Room Server"
+                role_label = translate("meshcore.role.room_server", "Room Server")
+                role_internal = "Room Server"
                 relay_capable = True
             elif type_bits == 0x04:
-                role = "Sensor"
+                role_label = translate("meshcore.role.sensor", "Sensor")
+                role_internal = "Sensor"
 
         # Store path info if this advert came through repeaters
         path_list = []
@@ -2278,11 +2309,11 @@ def decodeMeshCore(packet_bytes, snr=None, rssi=None):
                 h = path_data[i*hash_size : (i+1)*hash_size]
                 path_list.append(h.hex())
 
-        update_node(node_id, short_name=short_id, long_name=name, hw_model=role, role=role, lat=lat, lon=lon, public_key=node_id)
+        update_node(node_id, short_name=short_id, long_name=name, hw_model=role_label, role=role_label, lat=lat, lon=lon, public_key=node_id, role_id=role_internal)
         state.nodes[node_id]["relay_capable"] = relay_capable
         state.nodes[node_id]["last_path"] = path_list
 
-        log_to_console(f"[MESHCORE] ADVERT from {name} ({short_id}) - Role: {role}")
+        log_to_console(f"[MESHCORE] ADVERT from {name} ({short_id}) - Role: {role_internal}")
 
     elif payload_type == PAYLOAD_TYPE_TXT_MSG:
         if len(payload) >= 4:
@@ -2299,13 +2330,13 @@ def decodeMeshCore(packet_bytes, snr=None, rssi=None):
                 "from": src_name,
                 "from_id": src_id,
                 "to": dest_id,
-                "text": "[Encrypted Message]",
+                "text": translate("meshcore.message.encrypted", "[Encrypted Message]"),
                 "is_me": False,
             }
             state.messages.append(msg_obj)
             state.new_messages.append(msg_obj)
 
-            log_to_console(f"[MESHCORE] TXT from {src_id} to {dest_id} ([Encrypted Message])")
+            log_to_console(f"[MESHCORE] TXT from {src_id} to {dest_id} ({msg_obj['text']})")
 
     elif payload_type == PAYLOAD_TYPE_GRP_TXT:
         if len(payload) >= 1:
@@ -2317,12 +2348,12 @@ def decodeMeshCore(packet_bytes, snr=None, rssi=None):
                 "from": "Group",
                 "from_id": "group",
                 "to": "All",
-                "text": "[Encrypted Group Message]",
+                "text": translate("meshcore.message.group_encrypted", "[Encrypted Group Message]"),
                 "is_me": False,
             }
             state.messages.append(msg_obj)
             state.new_messages.append(msg_obj)
-            log_to_console(f"[MESHCORE] GRP_TXT ([Encrypted Group Message])")
+            log_to_console(f"[MESHCORE] GRP_TXT ({msg_obj['text']})")
 
     return True
 
@@ -3313,6 +3344,8 @@ def start_engine_direct():
 
         primary_calc = {"center_freq_hz": int(round(state.meshcore_custom_freq * 1_000_000)), "bw_khz": state.meshcore_custom_bw, "sf": state.meshcore_custom_sf}
         valid_configs = []
+        primary_key = "MESHCORE"
+        primary_preset_id = 0
     else:
         region = getattr(state, "direct_region", "EU_868")
     preset_name = state.direct_preset
@@ -4679,9 +4712,9 @@ def main_page():
                     const hopCls = (hops === 0) ? 'mesh-node-direct' : (hops === null || hops === undefined) ? 'mesh-node-unknown' : 'mesh-node-indirect';
 
                     let roleCls = '';
-                    if (n.role === 'Repeater') roleCls = 'mesh-node-repeater';
-                    else if (n.role === 'Room Server') roleCls = 'mesh-node-room-server';
-                    else if (n.role === 'Companion') roleCls = 'mesh-node-companion';
+                    if (n.role_id === 'Repeater') roleCls = 'mesh-node-repeater';
+                    else if (n.role_id === 'Room Server') roleCls = 'mesh-node-room-server';
+                    else if (n.role_id === 'Companion') roleCls = 'mesh-node-companion';
 
                     const relayCls = n.relay_capable ? 'mesh-node-relay-capable' : '';
 
@@ -5523,7 +5556,7 @@ def main_page():
                     ui.label(translate("panel.connection.settings.title", "Connection Settings")).classes('text-lg font-bold mb-2')
 
                     with ui.row().classes('w-full items-center mb-2'):
-                        ui.label("Network Ecosystem:").classes('mr-2 font-bold')
+                        ui.label(translate("panel.connection.settings.network_mode", "Network Ecosystem:")).classes('mr-2 font-bold')
                         network_mode_toggle = ui.toggle(
                             {"meshtastic": "Meshtastic", "meshcore": "MeshCore"},
                             value=state.network_mode,
@@ -5537,12 +5570,12 @@ def main_page():
                     with ui.tab_panels(tabs, value=tab_direct).classes('w-full'):
                         with ui.tab_panel(tab_direct):
                           if state.network_mode == "meshcore":
-                            ui.label("MeshCore SDR Engine").classes('font-bold mb-0')
-                            ui.markdown("Configure MeshCore radio parameters for the internal engine.").classes('text-sm text-gray-600')
+                            ui.label(translate("panel.connection.settings.meshcore.internal.title", "MeshCore SDR Engine")).classes('font-bold mb-0')
+                            ui.markdown(translate("panel.connection.settings.meshcore.internal.help", "Configure MeshCore radio parameters for the internal engine.")).classes('text-sm text-gray-600')
 
                             # MeshCore Region/Preset select
                             mc_region_options = {k: k.replace("_", "/") for k in MESHCORE_PRESETS.keys()}
-                            mc_region_options["CUSTOM"] = "Custom"
+                            mc_region_options["CUSTOM"] = translate("ui.custom", "Custom")
 
                             def _on_mc_region_change(e):
                                 state.meshcore_region = e.value
@@ -5564,11 +5597,11 @@ def main_page():
                                 options=mc_region_options,
                                 value=state.meshcore_region,
                                 on_change=_on_mc_region_change,
-                                label="Region"
+                                label=translate("panel.connection.settings.internal.label.region", "Region")
                             ).props('dense').classes('w-full mb-1')
 
                             if state.meshcore_region != "CUSTOM":
-                                mc_preset_options = {k: v["description"] for k, v in MESHCORE_PRESETS[state.meshcore_region].items()}
+                                mc_preset_options = {k: translate(v["description_key"]) for k, v in MESHCORE_PRESETS[state.meshcore_region].items()}
 
                                 def _on_mc_preset_change(e):
                                     state.meshcore_preset = e.value
@@ -5586,21 +5619,21 @@ def main_page():
                                     options=mc_preset_options,
                                     value=state.meshcore_preset,
                                     on_change=_on_mc_preset_change,
-                                    label="Preset"
+                                    label=translate("panel.connection.settings.internal.label.modempreset", "Preset")
                                 ).props('dense').classes('w-full mb-1')
 
                             with ui.row().classes('w-full gap-2'):
-                                ui.number("Freq (MHz)", value=state.meshcore_custom_freq, format="%.3f", on_change=lambda e: setattr(state, 'meshcore_custom_freq', e.value) or save_user_config()).props('dense').classes('flex-1')
-                                ui.number("SF", value=state.meshcore_custom_sf, precision=0, on_change=lambda e: setattr(state, 'meshcore_custom_sf', e.value) or save_user_config()).props('dense').classes('w-16')
+                                ui.number(translate("panel.connection.settings.meshcore.label.freq", "Freq (MHz)"), value=state.meshcore_custom_freq, format="%.3f", on_change=lambda e: setattr(state, 'meshcore_custom_freq', e.value) or save_user_config()).props('dense').classes('flex-1')
+                                ui.number(translate("panel.connection.settings.meshcore.label.sf", "SF"), value=state.meshcore_custom_sf, precision=0, on_change=lambda e: setattr(state, 'meshcore_custom_sf', e.value) or save_user_config()).props('dense').classes('w-16')
 
                             with ui.row().classes('w-full gap-2'):
-                                ui.number("BW (kHz)", value=state.meshcore_custom_bw, format="%.1f", on_change=lambda e: setattr(state, 'meshcore_custom_bw', e.value) or save_user_config()).props('dense').classes('flex-1')
-                                ui.number("CR", value=state.meshcore_custom_cr, precision=0, on_change=lambda e: setattr(state, 'meshcore_custom_cr', e.value) or save_user_config()).props('dense').classes('w-16')
+                                ui.number(translate("panel.connection.settings.meshcore.label.bw", "BW (kHz)"), value=state.meshcore_custom_bw, format="%.1f", on_change=lambda e: setattr(state, 'meshcore_custom_bw', e.value) or save_user_config()).props('dense').classes('flex-1')
+                                ui.number(translate("panel.connection.settings.meshcore.label.cr", "CR"), value=state.meshcore_custom_cr, precision=0, on_change=lambda e: setattr(state, 'meshcore_custom_cr', e.value) or save_user_config()).props('dense').classes('w-16')
 
-                            mc_advanced = ui.checkbox("Advanced LoRa Settings").props('dense').classes('text-xs mt-1')
+                            mc_advanced = ui.checkbox(translate("panel.connection.settings.meshcore.label.advanced", "Advanced LoRa Settings")).props('dense').classes('text-xs mt-1')
                             with ui.row().classes('w-full gap-2').bind_visibility_from(mc_advanced, 'value'):
-                                ui.number("Sync Word (hex)", value=state.meshcore_custom_sync_word, format="0x%02X", on_change=lambda e: setattr(state, 'meshcore_custom_sync_word', int(e.value)) or save_user_config()).props('dense').classes('flex-1')
-                                ui.number("Preamble", value=state.meshcore_custom_preamble_len, precision=0, on_change=lambda e: setattr(state, 'meshcore_custom_preamble_len', e.value) or save_user_config()).props('dense').classes('w-20')
+                                ui.number(translate("panel.connection.settings.meshcore.label.sync_word", "Sync Word (hex)"), value=state.meshcore_custom_sync_word, format="0x%02X", on_change=lambda e: setattr(state, 'meshcore_custom_sync_word', int(e.value)) or save_user_config()).props('dense').classes('flex-1')
+                                ui.number(translate("panel.connection.settings.meshcore.label.preamble", "Preamble"), value=state.meshcore_custom_preamble_len, precision=0, on_change=lambda e: setattr(state, 'meshcore_custom_preamble_len', e.value) or save_user_config()).props('dense').classes('w-20')
 
                           else:
                             ui.label(translate("panel.connection.settings.internal.title", "Internal SDR Engine")).classes('font-bold mb-0')
@@ -7237,18 +7270,18 @@ def main_page():
                                             popup_content += f"<b style='font-size:16px; margin-bottom: 8px; display: block;'>{name_display}</b>"
 
                                             if state.network_mode == "meshcore":
-                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>fingerprint</i> Public key: <span style='font-family:monospace; font-size:10px; word-break:break-all;'>{nid}</span><br>"
-                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>label</i> Short ID: {n['short_name']}<br>"
-                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>category</i> Type: {n['role']}<br>"
-                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>history</i> Freshness: {n['last_seen']}<br>"
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>fingerprint</i> {translate('ui.public_key', 'Public key')}: <span style='font-family:monospace; font-size:10px; word-break:break-all;'>{nid}</span><br>"
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>label</i> {translate('ui.short_id', 'Short ID')}: {n['short_name']}<br>"
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>category</i> {translate('ui.type', 'Type')}: {n['role']}<br>"
+                                                popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>history</i> {translate('ui.freshness', 'Freshness')}: {n['last_seen']}<br>"
 
                                                 # Radio Params for MeshCore
                                                 popup_content += "<div style='margin-top:4px; padding-top:4px; border-top:1px solid #ddd;'>"
-                                                popup_content += "<b>Radio parameters:</b><br>"
-                                                popup_content += f"Frequency: {state.meshcore_custom_freq}MHz<br>"
-                                                popup_content += f"Bandwidth: {state.meshcore_custom_bw}kHz<br>"
-                                                popup_content += f"Coding rate: {state.meshcore_custom_cr}<br>"
-                                                popup_content += f"Spreading factor: {state.meshcore_custom_sf}</div>"
+                                                popup_content += f"<b>{translate('ui.radio_parameters', 'Radio parameters')}:</b><br>"
+                                                popup_content += f"{translate('ui.frequency', 'Frequency')}: {state.meshcore_custom_freq}MHz<br>"
+                                                popup_content += f"{translate('ui.bandwidth', 'Bandwidth')}: {state.meshcore_custom_bw}kHz<br>"
+                                                popup_content += f"{translate('ui.coding_rate', 'Coding rate')}: {state.meshcore_custom_cr}<br>"
+                                                popup_content += f"{translate('ui.spreading_factor', 'Spreading factor')}: {state.meshcore_custom_sf}</div>"
                                             else:
                                                 if short_display:
                                                     popup_content += f"<i class='material-icons' style='font-size:16px; vertical-align:text-bottom;'>label</i> Short Name: {short_display}<br>"
@@ -7347,6 +7380,7 @@ def main_page():
                                             "popup": popup_content,
                                             "hops": n.get("hops"),
                                             "role": n.get("role"),
+                                            "role_id": n.get("role_id"),
                                             "relay_capable": n.get("relay_capable", False),
                                         })
 
@@ -7444,11 +7478,11 @@ def main_page():
                                 {'headerName': 'Long Name', 'field': 'long_name', 'width': 180, 'minWidth': 180, ':cellRenderer': 'window.meshCopyCellRenderer'},
                                 {'headerName': 'ID', 'field': 'id', 'width': 150, 'minWidth': 150, ':cellRenderer': 'window.meshCopyCellRenderer'},
                                 {'headerName': 'MAC', 'field': 'macaddr', 'width': 160, 'minWidth': 160, ':cellRenderer': 'window.meshCopyCellRenderer'},
-                                {'headerName': 'Public Key', 'field': 'public_key', 'width': 240, 'minWidth': 240, ':cellRenderer': 'window.meshCopyCellRenderer'},
+                                {'headerName': translate('ui.public_key', 'Public Key'), 'field': 'public_key', 'width': 240, 'minWidth': 240, ':cellRenderer': 'window.meshCopyCellRenderer'},
                                 {'headerName': 'Unmessagable', 'field': 'is_unmessagable', 'width': 120, ':valueFormatter': '(p) => (p.value === true ? \"true\" : \"false\")'},
-                                {'headerName': 'Model', 'field': 'hw_model', 'width': 160, 'minWidth': 160, ':cellRenderer': 'window.meshCopyCellRenderer'},
-                                {'headerName': 'Role', 'field': 'role', 'width': 140, 'minWidth': 140, ':cellRenderer': 'window.meshCopyCellRenderer'},
-                                {'headerName': 'Relay Capable', 'field': 'relay_capable', 'width': 130, ':valueFormatter': '(p) => (p.value === true ? \"true\" : \"false\")'},
+                                {'headerName': translate('ui.model', 'Model'), 'field': 'hw_model', 'width': 160, 'minWidth': 160, ':cellRenderer': 'window.meshCopyCellRenderer'},
+                                {'headerName': translate('ui.role', 'Role'), 'field': 'role', 'width': 140, 'minWidth': 140, ':cellRenderer': 'window.meshCopyCellRenderer'},
+                                {'headerName': translate('ui.relay_capable', 'Relay Capable'), 'field': 'relay_capable', 'width': 130, ':valueFormatter': '(p) => (p.value === true ? \"true\" : \"false\")'},
                                 {
                                     'headerName': 'Hops',
                                     'field': 'hops',
