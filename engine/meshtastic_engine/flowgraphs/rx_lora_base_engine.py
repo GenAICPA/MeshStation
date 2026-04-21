@@ -124,8 +124,6 @@ class rx_lora_base_engine(gr.top_block):
         self.sf = sf
         preamble_length = int(preamble_length)
         self.preamble_length = preamble_length
-        ppm = int(ppm)
-        self.payload_length = payload_length
         self.impl_head = impl_head
         self.has_crc = has_crc
         self.gain = gain

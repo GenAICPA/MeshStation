@@ -3338,7 +3338,7 @@ def start_engine_direct():
         device_args = raw_device_args
         if raw_device_args:
             cmd.extend(["--device-args", raw_device_args])
-        if getattr(state, 'direct_bias_tee', False):
+        if getattr(state, "direct_bias_tee", False):
             cmd.append("--bias-tee")
 
         log_to_console(f"[ENGINE][MESHCORE] Radio settings: freq={state.meshcore_custom_freq} MHz, bw={state.meshcore_custom_bw} kHz, sf={state.meshcore_custom_sf}")
@@ -3401,28 +3401,15 @@ def start_engine_direct():
             return
 
         primary_key, primary_preset_id, primary_calc, _ = primary
-    log_to_console(f"[ENGINE] Primary: {primary_key} (preset_id={primary_preset_id}), extra chains: {len(valid_configs)}")
-
-    if state.network_mode != "meshcore":
-        cmd = [
-            py, "-m", "meshtastic_engine.run_engine",
-            "--host", "127.0.0.1",
-            "--port", str(state.port),
-            "--center-freq", str(primary_calc["center_freq_hz"]),
-            "--samp-rate", "1000000",
-            "--lora-bw", str(int(round(primary_calc["bw_khz"] * 1000))),
-            "--sf", str(primary_calc["sf"]),
-            "--gain", str(int(state.direct_gain)),
-            "--ppm", str(int(state.direct_ppm)),
-            "--preset-id", str(primary_preset_id),
         ]
+    if device_args and not device_args_added:
+        cmd.extend(["--device-args", device_args])
+    if getattr(state, "direct_bias_tee", False) and not device_args_added:
+        cmd.append("--bias-tee")
+
     if valid_configs:
         import json as _json
         cmd.extend(["--extra-demod-configs", _json.dumps(valid_configs)])
-    if device_args and not device_args_added:
-        cmd.extend(["--device-args", device_args])
-    if getattr(state, 'direct_bias_tee', False) and not device_args_added:
-        cmd.append("--bias-tee")
 
     log_to_console(f"[ENGINE] Radio settings: freq={primary_calc['center_freq_hz']}, bw={int(round(primary_calc['bw_khz']*1000))}, sf={primary_calc['sf']}")
 
@@ -5562,16 +5549,16 @@ def main_page():
                         network_mode_toggle = ui.toggle(
                             {"meshtastic": "Meshtastic", "meshcore": "MeshCore"},
                             value=state.network_mode,
-                            on_change=lambda e: setattr(state, 'network_mode', e.value) or save_user_config() or _refresh_internal_tab.refresh()
+                            on_change=lambda e: setattr(state, 'network_mode', e.value) or save_user_config() or connection_dialog.update()
                         ).props('dense rounded unelevated color=blue')
 
                     with ui.tabs().classes('w-full mb-2') as tabs:
                         tab_direct = ui.tab(translate("panel.connection.settings.internaltab", "Internal"))
                         tab_ext = ui.tab(translate("panel.connection.settings.externaltab", "External"))
 
-                    @ui.refreshable
-                    def _refresh_internal_tab():
-                        if state.network_mode == "meshcore":
+                    with ui.tab_panels(tabs, value=tab_direct).classes('w-full'):
+                        with ui.tab_panel(tab_direct):
+                          if state.network_mode == "meshcore":
                             ui.label(translate("panel.connection.settings.meshcore.internal.title", "MeshCore SDR Engine")).classes('font-bold mb-0')
                             ui.markdown(translate("panel.connection.settings.meshcore.internal.help", "Configure MeshCore radio parameters for the internal engine.")).classes('text-sm text-gray-600')
 
@@ -5593,7 +5580,7 @@ def main_page():
                                     state.meshcore_custom_sync_word = p["sync"]
                                     state.meshcore_custom_preamble_len = p["preamble"]
                                 save_user_config()
-                                _refresh_internal_tab.refresh()
+                                connection_dialog.update()
 
                             ui.select(
                                 options=mc_region_options,
@@ -5615,7 +5602,7 @@ def main_page():
                                     state.meshcore_custom_sync_word = p["sync"]
                                     state.meshcore_custom_preamble_len = p["preamble"]
                                     save_user_config()
-                                    _refresh_internal_tab.refresh()
+                                    connection_dialog.update()
 
                                 ui.select(
                                     options=mc_preset_options,
@@ -5637,7 +5624,7 @@ def main_page():
                                 ui.number(translate("panel.connection.settings.meshcore.label.sync_word", "Sync Word (hex)"), value=state.meshcore_custom_sync_word, format="0x%02X", on_change=lambda e: setattr(state, 'meshcore_custom_sync_word', int(e.value)) or save_user_config()).props('dense').classes('flex-1')
                                 ui.number(translate("panel.connection.settings.meshcore.label.preamble", "Preamble"), value=state.meshcore_custom_preamble_len, precision=0, on_change=lambda e: setattr(state, 'meshcore_custom_preamble_len', e.value) or save_user_config()).props('dense').classes('w-20')
 
-                        else:
+                          else:
                             ui.label(translate("panel.connection.settings.internal.title", "Internal SDR Engine")).classes('font-bold mb-0')
                             ui.markdown(translate("panel.connection.settings.internal.help", 'The app manages the internal SDR engine for you.<br> Just select Region, Channel, PPM for your device and a suitable RF Gain.')).classes('text-sm text-gray-600')
                             _saved_device_args = str(getattr(state, "direct_device_args", "rtl=0") or "").strip()
@@ -5838,24 +5825,19 @@ def main_page():
                                         "from different folders with different SDR devices."
                                     )
                                 ).classes('whitespace-pre-line')
+                            with ui.row().classes('w-full justify-end gap-2'):
+                                ui.button(translate("button.cancel", "Cancel"), on_click=connection_dialog.close).classes('bg-slate-200 text-slate-900')
+                                def _on_connect_direct_click():
+                                    # If a scan is running and "Auto" is used, cancel it immediately.
+                                    if _scan_state['running']:
+                                        _scan_state['cancel'] = True
+                                    _do_connect_direct()
+                                    connection_dialog.close()
 
-                        with ui.row().classes('w-full justify-end gap-2'):
-                            ui.button(translate("button.cancel", "Cancel"), on_click=connection_dialog.close).classes('bg-slate-200 text-slate-900')
-                            def _on_connect_direct_click():
-                                # If a scan is running and "Auto" is used, cancel it immediately.
-                                if _scan_state['running']:
-                                    _scan_state['cancel'] = True
-                                _do_connect_direct()
-                                connection_dialog.close()
-
-                            connect_direct_btn = ui.button(
-                                translate("button.connect", "Connect"),
-                                on_click=_on_connect_direct_click
-                            ).classes('bg-blue-600 text-white')
-
-                    with ui.tab_panels(tabs, value=tab_direct).classes('w-full'):
-                        with ui.tab_panel(tab_direct):
-                            _refresh_internal_tab()
+                                connect_direct_btn = ui.button(
+                                    translate("button.connect", "Connect"),
+                                    on_click=_on_connect_direct_click
+                                ).classes('bg-blue-600 text-white')
 
                         with ui.tab_panel(tab_ext):
                             ui.label(translate("panel.connection.settings.external.title", "External GNU Radio / ZMQ stream")).classes('font-bold mb-1')
